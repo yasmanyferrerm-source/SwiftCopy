@@ -1,0 +1,79 @@
+name: Build SwiftCopy
+
+# Manual run only (Actions tab -> Build SwiftCopy -> Run workflow, or the PC Build Tool).
+# Publishes a GitHub Release with:
+#   SwiftCopy-Setup-<version>.exe  - installer (per user, no admin needed)
+#   SwiftCopy-Portable.exe         - single file, runs without installing
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: "Release notes (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pytest
+
+      - name: Run tests
+        run: python -m pytest -q tests
+
+      - name: Read version
+        id: ver
+        shell: bash
+        run: echo "version=$(python -c 'import swiftcopy; print(swiftcopy.__version__)')" >> "$GITHUB_OUTPUT"
+
+      - name: Build app folder (for the installer)
+        run: >
+          pyinstaller --noconfirm --clean --onedir --windowed
+          --name SwiftCopy --icon assets/icon.ico
+          --add-data "assets;assets"
+          run_swiftcopy.py
+
+      - name: Build portable exe
+        run: >
+          pyinstaller --noconfirm --onefile --windowed
+          --name SwiftCopy-Portable --icon assets/icon.ico
+          --add-data "assets;assets"
+          run_swiftcopy.py
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc "/DMyAppVersion=${{ steps.ver.outputs.version }}" installer\SwiftCopy.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NOTES: ${{ github.event.inputs.notes }}
+        run: |
+          VER="${{ steps.ver.outputs.version }}"
+          TAG="v${VER}-build${{ github.run_number }}"
+          BODY="${NOTES:-SwiftCopy $VER (build ${{ github.run_number }}). Run SwiftCopy-Setup-$VER.exe to install, or use SwiftCopy-Portable.exe without installing.}"
+          gh release create "$TAG" \
+            "dist/SwiftCopy-Setup-$VER.exe" \
+            "dist/SwiftCopy-Portable.exe" \
+            --title "SwiftCopy $VER (build ${{ github.run_number }})" \
+            --notes "$BODY" \
+            --latest
