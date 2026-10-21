@@ -7,13 +7,14 @@ import json
 import os
 import sys
 
-from PySide6.QtCore import QByteArray
+from PySide6.QtCore import QByteArray, QSettings
 from PySide6.QtGui import QIcon
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QStyleFactory
 
 from . import APP_NAME, __version__
-from .ui import STYLE, MainWindow
+from . import theme
+from .ui import MainWindow
 
 
 def resource(*parts: str) -> str:
@@ -71,7 +72,7 @@ def main(argv=None) -> int:
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
     app.setStyle(QStyleFactory.create("Fusion"))
-    app.setStyleSheet(STYLE)
+    theme.apply(app, QSettings(APP_NAME, APP_NAME).value("theme", "system"))
     app.setQuitOnLastWindowClosed(False)  # the tray keeps it alive; MainWindow decides when to quit
 
     if args.paste:  # right-click "Paste with SwiftCopy"
