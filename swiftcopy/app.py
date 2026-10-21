@@ -26,6 +26,9 @@ def parse_args(argv):
     p.add_argument("paths", nargs="*", help="files or folders to copy")
     p.add_argument("--dest", help="destination folder (starts right away when given)")
     p.add_argument("--move", action="store_true", help="move instead of copy")
+    p.add_argument("--paste", metavar="FOLDER",
+                   help="paste the files copied/cut in Explorer into FOLDER")
+    p.add_argument("--tray", action="store_true", help="start hidden in the tray")
     p.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     return p.parse_args(argv)
 
@@ -55,7 +58,8 @@ def main(argv=None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     payload = {"paths": [os.path.abspath(p) for p in args.paths],
                "dest": os.path.abspath(args.dest) if args.dest else None,
-               "move": args.move}
+               "move": args.move,
+               "show": not args.tray}
 
     if os.name == "nt":
         try:  # own taskbar icon instead of python's
@@ -68,7 +72,16 @@ def main(argv=None) -> int:
     app.setApplicationName(APP_NAME)
     app.setStyle(QStyleFactory.create("Fusion"))
     app.setStyleSheet(STYLE)
-    app.setQuitOnLastWindowClosed(True)
+    app.setQuitOnLastWindowClosed(False)  # the tray keeps it alive; MainWindow decides when to quit
+
+    if args.paste:  # right-click "Paste with SwiftCopy"
+        from .ui import clipboard_files
+        paths, cut = clipboard_files()
+        if not paths:
+            return 0
+        payload.update(paths=paths, dest=os.path.abspath(args.paste), move=cut)
+        if cut:
+            app.clipboard().clear()
 
     # Already running? Add these files to its queue instead of opening a second window.
     if send_to_running(payload):
@@ -97,15 +110,19 @@ def main(argv=None) -> int:
                 data = json.loads(buf.decode("utf-8") or "{}")
             except ValueError:
                 return
-            win.set_sources(data.get("paths") or [], data.get("dest"), bool(data.get("move")),
-                            autostart=bool(data.get("dest")))
+            if data.get("paths") or data.get("dest"):
+                win.set_sources(data.get("paths") or [], data.get("dest"), bool(data.get("move")),
+                                autostart=bool(data.get("dest")))
+            elif data.get("show", True):
+                win.bring_to_front()
 
         conn.readyRead.connect(read)
         conn.disconnected.connect(finished)
 
     server.newConnection.connect(on_connection)
 
-    win.show()
+    if payload["show"] or not win.tray:
+        win.show()
     if payload["paths"] or payload["dest"]:
         win.set_sources(payload["paths"], payload["dest"], payload["move"],
                         autostart=bool(payload["dest"]))

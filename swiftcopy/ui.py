@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
-from . import APP_NAME, __version__, shell
+from . import APP_NAME, __version__, integration, shell
 from .dialogs import CollisionDialog, ErrorDialog
 from .engine import (
     Collision, CopyEngine, ErrorAction, FINAL_STATES, Settings, Status, format_eta, format_size,
@@ -63,6 +63,25 @@ QTabWidget::pane { border: 1px solid #e3e7ee; border-radius: 8px; background: #f
 QTabBar::tab { padding: 7px 16px; color: #4b5563; }
 QTabBar::tab:selected { color: #1d4ed8; font-weight: 600; border-bottom: 2px solid #2563eb; }
 """
+
+
+def clipboard_files() -> tuple[list[str], bool]:
+    """Files copied (or cut) in Explorer: (paths, was_cut)."""
+    md = QApplication.clipboard().mimeData()
+    if md is None:
+        return [], False
+    paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+    cut = False
+    for fmt in md.formats():  # Explorer marks Ctrl+X with "Preferred DropEffect" = 2
+        if "Preferred DropEffect" in fmt:
+            raw = bytes(md.data(fmt))
+            if len(raw) >= 4 and struct.unpack("<I", raw[:4])[0] & 2:
+                cut = True
+    return paths, cut
+
+
+def _truthy(v) -> bool:
+    return str(v).lower() in ("1", "true", "yes")
 
 
 # ------------------------------------------------------------------- drop list
@@ -210,12 +229,31 @@ class MainWindow(QMainWindow):
         self._showing_prompt = False
         self._was_running = False
         self._error_rows = 0
+        self._quitting = False
+        self._tray_hint_shown = False
 
         self.tray = QSystemTrayIcon(icon, self) if QSystemTrayIcon.isSystemTrayAvailable() else None
         if self.tray:
             self.tray.setToolTip(APP_NAME)
-            self.tray.activated.connect(lambda *_: (self.showNormal(), self.activateWindow()))
+            self.tray.activated.connect(self._tray_clicked)
+            menu = QMenu(self)
+            menu.addAction("Open SwiftCopy", self.bring_to_front)
+            self.tray_pause = menu.addAction("Pause", self.toggle_pause)
+            menu.addSeparator()
+            menu.addAction("Quit SwiftCopy", self.quit_app)
+            self.tray.setContextMenu(menu)
             self.tray.show()
+
+        # Ctrl+V in File Explorer goes through SwiftCopy
+        self.paste_hook = integration.PasteHook(
+            self.explorer_paste, lambda fn: QTimer.singleShot(0, fn))
+        if integration.IS_WIN and _truthy(self.store.value("intercept_paste", True)):
+            self.paste_hook.install()
+        if integration.IS_WIN and integration.frozen():
+            try:  # keep startup / right-click entries pointing at this copy of the app
+                integration.refresh_registered_paths()
+            except OSError:
+                pass
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -458,7 +496,7 @@ class MainWindow(QMainWindow):
         form.addRow("", self.set_times)
 
         self.set_finish = QComboBox()
-        self.set_finish.addItems(["Show a notification", "Do nothing", "Close SwiftCopy"])
+        self.set_finish.addItems(["Show a notification", "Do nothing", "Close the window"])
         self.set_finish.setCurrentIndex(int(self.store.value("when_finished", 0)))
         form.addRow("When everything is done", self.set_finish)
         outer.addLayout(form)
@@ -475,19 +513,39 @@ class MainWindow(QMainWindow):
         sep.setFrameShape(QFrame.HLine)
         sep.setStyleSheet("color: #e5e7eb;")
         outer.addWidget(sep)
-        ex = QLabel("Explorer integration")
+        ex = QLabel("Windows integration")
         ex.setObjectName("h")
         outer.addWidget(ex)
-        hint = QLabel("Adds SwiftCopy to the right-click “Send to” menu. No admin rights needed.")
+        hint = QLabel("All of these are for your user only — no admin rights needed.")
         hint.setObjectName("muted")
         outer.addWidget(hint)
-        row = QHBoxLayout()
-        self.sendto_btn = QPushButton()
-        self.sendto_btn.clicked.connect(self.toggle_sendto)
-        row.addWidget(self.sendto_btn)
-        row.addStretch(1)
-        outer.addLayout(row)
-        self._update_sendto_btn()
+
+        win = integration.IS_WIN
+        self.int_paste = QCheckBox("Use SwiftCopy as the default copier — Ctrl+V in File Explorer "
+                                   "and on the desktop copies with SwiftCopy")
+        self.int_paste.setChecked(win and self.paste_hook.active)
+        self.int_menu = QCheckBox("Add “Paste with SwiftCopy” to the right-click menu")
+        self.int_menu.setChecked(integration.context_menu_enabled())
+        self.int_sendto = QCheckBox("Add SwiftCopy to the right-click “Send to” menu")
+        self.int_sendto.setChecked(shell.is_installed())
+        self.int_startup = QCheckBox("Start SwiftCopy with Windows (in the tray, next to the clock)")
+        self.int_startup.setChecked(integration.autostart_enabled())
+        self.int_tray = QCheckBox("Keep running in the tray when the window is closed")
+        self.int_tray.setChecked(_truthy(self.store.value("keep_in_tray", True)))
+        for cb in (self.int_paste, self.int_menu, self.int_sendto, self.int_startup, self.int_tray):
+            cb.setEnabled(win if cb is not self.int_tray else self.tray is not None)
+            outer.addWidget(cb)
+        self.int_paste.toggled.connect(self._toggle_paste_hook)
+        self.int_menu.toggled.connect(lambda on: self._apply_integration(integration.set_context_menu, on))
+        self.int_sendto.toggled.connect(self._toggle_sendto)
+        self.int_startup.toggled.connect(lambda on: self._apply_integration(integration.set_autostart, on))
+        self.int_tray.toggled.connect(lambda on: self.store.setValue("keep_in_tray", on))
+        note = QLabel("The Ctrl+V takeover works while SwiftCopy is running, so keep “Start with "
+                      "Windows” on. Dragging files with the mouse still uses Windows’ own copy — "
+                      "right-click → Paste with SwiftCopy covers that.")
+        note.setObjectName("muted")
+        note.setWordWrap(True)
+        outer.addWidget(note)
         outer.addStretch(1)
         ver = QLabel(f"{APP_NAME} {__version__}")
         ver.setObjectName("muted")
@@ -540,23 +598,29 @@ class MainWindow(QMainWindow):
         st.setValue("keep_timestamps", s.keep_timestamps)
         st.setValue("when_finished", self.set_finish.currentIndex())
 
-    def _update_sendto_btn(self):
-        if os.name != "nt":
-            self.sendto_btn.setText("Add to “Send to” menu (Windows only)")
-            self.sendto_btn.setEnabled(False)
-            return
-        self.sendto_btn.setText("Remove from “Send to” menu" if shell.is_installed()
-                                else "Add to “Send to” menu")
-
-    def toggle_sendto(self):
+    def _apply_integration(self, fn, on: bool):
         try:
-            if shell.is_installed():
-                shell.uninstall_sendto()
-            else:
-                shell.install_sendto()
+            fn(on)
         except Exception as e:  # noqa: BLE001
-            QMessageBox.warning(self, APP_NAME, f"Couldn't update the Send To menu:\n{e}")
-        self._update_sendto_btn()
+            QMessageBox.warning(self, APP_NAME, f"Couldn't change that setting:\n{e}")
+
+    def _toggle_sendto(self, on: bool):
+        self._apply_integration(lambda v: shell.install_sendto() if v else shell.uninstall_sendto(), on)
+
+    def _toggle_paste_hook(self, on: bool):
+        self.store.setValue("intercept_paste", on)
+        if on:
+            if not self.paste_hook.install():
+                QMessageBox.warning(self, APP_NAME, "Windows didn't allow SwiftCopy to watch for "
+                                    "Ctrl+V. Right-click → Paste with SwiftCopy still works.")
+                self.int_paste.blockSignals(True)
+                self.int_paste.setChecked(False)
+                self.int_paste.blockSignals(False)
+                self.store.setValue("intercept_paste", False)
+            elif not self.int_tray.isChecked():
+                self.int_tray.setChecked(True)  # the takeover needs SwiftCopy to stay running
+        else:
+            self.paste_hook.uninstall()
 
     # ---------------------------------------------------------------- sources
     def add_files(self):
@@ -574,18 +638,27 @@ class MainWindow(QMainWindow):
             self.dest.setCurrentText(os.path.normpath(d))
 
     def paste_from_clipboard(self):
-        md = QApplication.clipboard().mimeData()
-        paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()] if md else []
+        paths, cut = clipboard_files()
         if not paths:
             self.statusBar().showMessage("Nothing to paste — copy files in Explorer first (Ctrl+C).", 4000)
             return
         self.sources.add_paths(paths)
-        # Explorer marks Cut (Ctrl+X) with "Preferred DropEffect" = 2 (move)
-        for fmt in md.formats():
-            if "Preferred DropEffect" in fmt:
-                raw = bytes(md.data(fmt))
-                if len(raw) >= 4 and struct.unpack("<I", raw[:4])[0] & 2:
-                    self.statusBar().showMessage("Files were cut in Explorer — use Move.", 5000)
+        if cut:
+            self.statusBar().showMessage("Files were cut in Explorer — use Move.", 5000)
+
+    def explorer_paste(self, root_hwnd: int):
+        """Ctrl+V caught in File Explorer: copy the clipboard files into that folder."""
+        folder = integration.explorer_folder(root_hwnd)
+        paths, cut = clipboard_files()
+        if not folder or not paths:
+            integration.send_native_paste()  # not a normal folder - let Explorer do it
+            return
+        self.engine.add_job(paths, folder, move=cut)
+        if cut:
+            QApplication.clipboard().clear()  # same as Explorer: cut files paste once
+        self.tabs.setCurrentIndex(0)
+        self.showNormal()
+        self.raise_()
 
     def set_sources(self, paths, dest=None, move=False, autostart=False):
         self.sources.add_paths(paths)
@@ -758,6 +831,11 @@ class MainWindow(QMainWindow):
         self.stats_lbl.setText("   ·   ".join(parts))
 
         self.pause_btn.setText("Resume" if self.engine.is_paused else "Pause")
+        if self.tray:
+            self.tray_pause.setText(self.pause_btn.text())
+            self.tray_pause.setEnabled(running)
+            self.tray.setToolTip(f"{APP_NAME} — {frac * 100:.0f}% {self.state_lbl.text()}"
+                                 if running else APP_NAME)
         self.pause_btn.setEnabled(running)
         self.skip_btn.setEnabled(running and cur is not None)
         self.cancel_btn.setEnabled(running)
@@ -822,7 +900,39 @@ class MainWindow(QMainWindow):
             self.close()
 
     # ------------------------------------------------------------------ close
+    def bring_to_front(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_clicked(self, reason):
+        if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
+            if self.isVisible() and not self.isMinimized():
+                self.hide()
+            else:
+                self.bring_to_front()
+
+    def keeps_running_in_tray(self) -> bool:
+        return self.tray is not None and _truthy(self.store.value("keep_in_tray", True))
+
+    def quit_app(self):
+        self._quitting = True
+        if self.close():
+            QApplication.quit()
+        else:
+            self._quitting = False
+
     def closeEvent(self, e):
+        if not self._quitting and self.keeps_running_in_tray():
+            # Closing the window just hides it; copies keep going and Ctrl+V keeps working.
+            e.ignore()
+            self.hide()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self.tray.showMessage(APP_NAME, "SwiftCopy is still running in the tray. "
+                                      "Right-click its icon to quit.",
+                                      QSystemTrayIcon.Information, 4000)
+            return
         if self.engine.is_running:
             r = QMessageBox.question(self, APP_NAME,
                                      "Transfers are still running. Cancel them and quit?")
@@ -831,6 +941,8 @@ class MainWindow(QMainWindow):
                 return
             self.engine.cancel_all()
             self.engine.wait(5)
+        self.paste_hook.uninstall()
         if self.tray:
             self.tray.hide()
         e.accept()
+        QApplication.quit()

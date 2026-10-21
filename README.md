@@ -15,6 +15,8 @@ A file copy manager for Windows, in the spirit of SuperCopier / TeraCopy. One po
 - Keeps original modified dates; handles long paths (over 260 characters).
 - **Explorer integration** — drag and drop onto the window, paste files you copied in Explorer (Ctrl+V), and an optional **Send to → SwiftCopy** entry (Settings tab).
 - Single window: sending more files while it's open adds them to the running queue.
+- **Default copier** — while SwiftCopy runs, Ctrl+V of copied/cut files in File Explorer or on the desktop goes through SwiftCopy (special places like "This PC" fall back to Windows). Plus a right-click **Paste with SwiftCopy** entry.
+- **Starts with Windows** in the tray; closing the window keeps it running there (right-click the tray icon → Quit).
 
 ## Command line
 
