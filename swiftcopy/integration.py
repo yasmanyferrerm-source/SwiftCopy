@@ -37,6 +37,42 @@ def app_icon() -> str:
     return f'"{target}",0'
 
 
+# ------------------------------------------------------- Microsoft Store (MSIX)
+def package_family_name() -> str | None:
+    """The Store package family name when running as an installed MSIX app, else None."""
+    if not IS_WIN:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    length = wintypes.UINT(0)
+    fn = ctypes.windll.kernel32.GetCurrentPackageFamilyName
+    if fn(ctypes.byref(length), None) != 122:  # ERROR_INSUFFICIENT_BUFFER means "packaged"
+        return None
+    buf = ctypes.create_unicode_buffer(length.value)
+    if fn(ctypes.byref(length), buf) != 0:
+        return None
+    return buf.value
+
+
+def is_packaged() -> bool:
+    return package_family_name() is not None
+
+
+def real_local_appdata() -> str:
+    """Where Windows really keeps this app's %LOCALAPPDATA% files.
+    Store apps' writes are redirected into their package folder, which Explorer must use."""
+    base = os.environ.get("LOCALAPPDATA", "")
+    pfn = package_family_name()
+    if pfn:
+        return os.path.join(base, "Packages", pfn, "LocalCache", "Local")
+    return base
+
+
+def open_startup_settings() -> None:
+    if IS_WIN:
+        os.startfile("ms-settings:startupapps")  # type: ignore[attr-defined]
+
+
 # ------------------------------------------------------------- registry helpers
 if IS_WIN:
     import winreg

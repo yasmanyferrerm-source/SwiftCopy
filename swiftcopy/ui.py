@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import APP_NAME, __version__, integration, shell, theme
-from .log import log, log_path
+from .log import log, log_path, log_path_for_explorer
 from .dialogs import CollisionDialog, ErrorDialog
 from .engine import (
     Collision, CopyEngine, ErrorAction, FINAL_STATES, Settings, Status, format_eta, format_size,
@@ -504,7 +504,8 @@ class MainWindow(QMainWindow):
         self.paste_hook = integration.PasteHook(self.paste_requested.emit)
         if integration.IS_WIN and _truthy(self.store.value("intercept_paste", True)):
             self.paste_hook.install()
-        if integration.IS_WIN and integration.frozen():
+        self.packaged = integration.is_packaged()
+        if integration.IS_WIN and integration.frozen() and not self.packaged:
             try:  # keep startup / right-click entries pointing at this copy of the app
                 integration.refresh_registered_paths()
             except OSError:
@@ -918,14 +919,27 @@ class MainWindow(QMainWindow):
         for cb in (self.int_paste, self.int_menu, self.int_sendto, self.int_startup, self.int_tray):
             cb.setEnabled(win if cb is not self.int_tray else self.tray is not None)
             gl.addWidget(cb)
+        if self.packaged:
+            # Store installs can't change Explorer's menus or the Run list; Windows manages startup.
+            for cb in (self.int_menu, self.int_sendto, self.int_startup):
+                cb.hide()
+            row = QHBoxLayout()
+            row.addWidget(label("SwiftCopy starts with Windows in the tray. Turn that on or off in "
+                                "Windows Settings → Apps → Startup.", "muted", wrap=True), 1)
+            startup_btn = QPushButton("Open startup settings")
+            startup_btn.clicked.connect(integration.open_startup_settings)
+            row.addWidget(startup_btn)
+            gl.addLayout(row)
         self.int_paste.toggled.connect(self._toggle_paste_hook)
         self.int_menu.toggled.connect(lambda on: self._apply_integration(integration.set_context_menu, on))
         self.int_sendto.toggled.connect(self._toggle_sendto)
         self.int_startup.toggled.connect(lambda on: self._apply_integration(integration.set_autostart, on))
         self.int_tray.toggled.connect(lambda on: self.store.setValue("keep_in_tray", on))
+        tail = ("drop files on SwiftCopy's window or use its Paste button for those." if self.packaged
+                else "use right-click → Paste with SwiftCopy for those.")
         gl.addWidget(label("SwiftCopy takes over Ctrl+V only. Dragging files with the mouse, and "
                            "Paste from Explorer's own right-click menu or toolbar, still use Windows' "
-                           "copy — use right-click → Paste with SwiftCopy for those.", "muted", wrap=True))
+                           "copy — " + tail, "muted", wrap=True))
         lay.addWidget(g)
 
         g, gl = group("Troubleshooting")
@@ -1044,10 +1058,10 @@ class MainWindow(QMainWindow):
             self.paste_hook.uninstall()
 
     def open_log(self):
-        path = log_path()
-        if not os.path.exists(path):
+        if not os.path.exists(log_path()):
             log("log opened")
-        shell.open_in_explorer(path)
+        path = log_path_for_explorer()
+        shell.open_in_explorer(path if os.path.exists(path) else os.path.dirname(path))
 
     def restart_hook(self):
         if not integration.IS_WIN:

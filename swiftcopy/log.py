@@ -38,3 +38,15 @@ def log(msg: str) -> None:
                     f.write(line)
             except OSError:
                 pass
+
+
+def log_path_for_explorer() -> str:
+    """Same file as log_path(), but the real location Explorer can open (differs for Store installs)."""
+    try:
+        from .integration import real_local_appdata
+        base = real_local_appdata()
+        if base:
+            return os.path.join(base, "SwiftCopy", "SwiftCopy.log")
+    except Exception:  # noqa: BLE001
+        pass
+    return log_path()

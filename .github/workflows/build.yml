@@ -54,6 +54,33 @@ jobs:
           Get-Content $out
           if ($p.ExitCode -ne 0) { Write-Error "packaged self-test failed"; exit 1 }
 
+      - name: Build Microsoft Store package (.msix)
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.ver.outputs.version }}.0"   # the Store wants x.y.z.0
+          $layout = Join-Path $env:RUNNER_TEMP "msix"
+          Remove-Item $layout -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item "dist\SwiftCopy" $layout -Recurse
+          Copy-Item "packaging\msix\Assets" (Join-Path $layout "Assets") -Recurse
+          (Get-Content "packaging\msix\AppxManifest.xml" -Raw).Replace("__VERSION__", $ver) |
+            Set-Content (Join-Path $layout "AppxManifest.xml") -Encoding utf8
+          $kit = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin\*\x64\makeappx.exe" |
+            Sort-Object FullName | Select-Object -Last 1
+          $signtool = Join-Path $kit.DirectoryName "signtool.exe"
+          & $kit.FullName pack /d $layout /p "dist\SwiftCopy-Store-${{ steps.ver.outputs.version }}.msix" /o
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          # A test-signed copy for trying the Store version before Microsoft reviews it.
+          Copy-Item "dist\SwiftCopy-Store-${{ steps.ver.outputs.version }}.msix" "dist\SwiftCopy-StoreTest.msix"
+          $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=89A5A13E-7E4F-44CA-A558-D9E4282A4BD1" `
+            -KeyUsage DigitalSignature -FriendlyName "SwiftCopy test" -CertStoreLocation "Cert:\CurrentUser\My" `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+          $pw = ConvertTo-SecureString -String "swiftcopy-test" -Force -AsPlainText
+          Export-PfxCertificate -Cert $cert -FilePath "$env:RUNNER_TEMP\test.pfx" -Password $pw | Out-Null
+          Export-Certificate -Cert $cert -FilePath "dist\SwiftCopy-StoreTest.cer" | Out-Null
+          & $signtool sign /fd SHA256 /f "$env:RUNNER_TEMP\test.pfx" /p "swiftcopy-test" "dist\SwiftCopy-StoreTest.msix"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: Build portable exe
         run: >
           pyinstaller --noconfirm --onefile --windowed
@@ -84,6 +111,9 @@ jobs:
           gh release create "$TAG" \
             "dist/SwiftCopy-Setup-$VER.exe" \
             "dist/SwiftCopy-Portable.exe" \
+            "dist/SwiftCopy-Store-$VER.msix" \
+            "dist/SwiftCopy-StoreTest.msix" \
+            "dist/SwiftCopy-StoreTest.cer" \
             --title "SwiftCopy $VER (build ${{ github.run_number }})" \
             --notes "$BODY" \
             --latest

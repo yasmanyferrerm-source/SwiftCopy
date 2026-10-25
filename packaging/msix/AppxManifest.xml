@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Microsoft Store package for SwiftCopy. The build replaces __VERSION__ (x.y.z.0).
+     Identity values come from Partner Center > SwiftCopy > Product management > Product identity. -->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap uap10 desktop rescap">
+
+  <Identity
+    Name="yasmanyfmSoft.SwiftCopy"
+    Publisher="CN=89A5A13E-7E4F-44CA-A558-D9E4282A4BD1"
+    Version="__VERSION__"
+    ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>SwiftCopy</DisplayName>
+    <PublisherDisplayName>yasmanyfmSoft</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>Fast file copy manager with a queue, pause and resume, and smart conflict handling.</Description>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Applications>
+    <Application Id="SwiftCopy" Executable="SwiftCopy.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="SwiftCopy"
+        Description="Fast file copy manager with a queue, pause and resume, and smart conflict handling."
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png">
+        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" ShortName="SwiftCopy" />
+      </uap:VisualElements>
+      <Extensions>
+        <!-- Starts SwiftCopy hidden in the tray when the user signs in.
+             The user can turn this off in Settings > Apps > Startup. -->
+        <desktop:Extension
+          Category="windows.startupTask"
+          Executable="SwiftCopy.exe"
+          EntryPoint="Windows.FullTrustApplication"
+          uap10:Parameters="--tray">
+          <desktop:StartupTask TaskId="SwiftCopyStartup" Enabled="true" DisplayName="SwiftCopy" />
+        </desktop:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

@@ -46,4 +46,26 @@ if __name__ == "__main__":
     big.save(os.path.join(OUT, "icon.png"))
     big.save(os.path.join(OUT, "icon.ico"),
              sizes=[(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)])
+
+    # Microsoft Store (MSIX) logos
+    msix = os.path.join(HERE, "..", "packaging", "msix", "Assets")
+    os.makedirs(msix, exist_ok=True)
+
+    def square(px, name):
+        draw(512).resize((px, px), Image.LANCZOS).save(os.path.join(msix, name))
+
+    square(44, "Square44x44Logo.png")
+    square(88, "Square44x44Logo.scale-200.png")
+    for ts in (16, 24, 32, 48, 256):
+        square(ts, f"Square44x44Logo.targetsize-{ts}.png")
+        square(ts, f"Square44x44Logo.targetsize-{ts}_altform-unplated.png")
+    square(150, "Square150x150Logo.png")
+    square(300, "Square150x150Logo.scale-200.png")
+    square(50, "StoreLogo.png")
+    square(100, "StoreLogo.scale-200.png")
+    for w, h, name in ((310, 150, "Wide310x150Logo.png"), (620, 300, "Wide310x150Logo.scale-200.png")):
+        wide = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        tile = draw(512).resize((h, h), Image.LANCZOS)
+        wide.paste(tile, ((w - h) // 2, 0), tile)
+        wide.save(os.path.join(msix, name))
     print("icon written")
