@@ -1355,7 +1355,8 @@ class MainWindow(QMainWindow):
                 self.title_lbl.setText("Ready")
                 self.sub_lbl.setText("Copy files in File Explorer and press Ctrl+V, or add them below."
                                      if self.paste_hook.active else
-                                     "Add files below, or right-click a folder → Paste with SwiftCopy.")
+                                     ("Add files below, or drop them on this window." if self.packaged else
+                                      "Add files below, or right-click a folder → Paste with SwiftCopy."))
 
         self.pause_btn.setText("Resume" if self.engine.is_paused else "Pause")
         for b in (self.pause_btn, self.skip_btn, self.cancel_btn):
