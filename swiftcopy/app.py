@@ -30,6 +30,7 @@ def parse_args(argv):
     p.add_argument("--paste", metavar="FOLDER",
                    help="paste the files copied/cut in Explorer into FOLDER")
     p.add_argument("--tray", action="store_true", help="start hidden in the tray")
+    p.add_argument("--selftest", metavar="FILE", help=argparse.SUPPRESS)
     p.add_argument("--version", action="version", version=f"{APP_NAME} {__version__}")
     return p.parse_args(argv)
 
@@ -55,8 +56,37 @@ def send_to_running(payload: dict) -> bool:
     return True
 
 
+def selftest(path: str) -> int:
+    """Checks the packaged app can do the Explorer parts (used by the build)."""
+    from . import integration
+    out = {"version": __version__, "frozen": integration.frozen()}
+    try:
+        import pythoncom  # noqa: F401
+        import win32com.client
+        shell = win32com.client.Dispatch("Shell.Application")
+        out["shell_windows"] = shell.Windows().Count
+        out["pywin32"] = True
+    except Exception as e:  # noqa: BLE001
+        out["pywin32"] = False
+        out["pywin32_error"] = repr(e)
+    try:
+        import ctypes
+        progman = ctypes.windll.user32.FindWindowW("Progman", None)
+        out["desktop_lookup"] = list(integration.explorer_folder(progman)) if progman else "no desktop"
+    except Exception as e:  # noqa: BLE001
+        out["desktop_lookup"] = repr(e)
+    hook = integration.PasteHook(lambda hwnd: None)
+    out["hook"] = hook.install()
+    hook.uninstall()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, indent=2)
+    return 0 if out["pywin32"] and out["hook"] else 1
+
+
 def main(argv=None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
+    if args.selftest:
+        return selftest(args.selftest)
     payload = {"paths": [os.path.abspath(p) for p in args.paths],
                "dest": os.path.abspath(args.dest) if args.dest else None,
                "move": args.move,

@@ -40,11 +40,14 @@ def test_context_menu_roundtrip():
 
 def test_paste_hook_installs():
     from swiftcopy import integration as i
-    hook = i.PasteHook(lambda hwnd: None, lambda fn: fn())
+    hook = i.PasteHook(lambda hwnd: None)
     assert hook.install()
     assert hook.active
+    assert hook.armed_count == 1
     hook.uninstall()
     assert not hook.active
+    assert hook.install()  # can be turned on again
+    hook.uninstall()
 
 
 def test_desktop_dir_exists():
@@ -56,3 +59,21 @@ def test_pywin32_shell_available():
     import win32com.client
     shell = win32com.client.Dispatch("Shell.Application")
     list(shell.Windows())  # must not raise
+
+
+def test_explorer_folder_desktop_and_bad_window():
+    import ctypes
+    from swiftcopy import integration as i
+    progman = ctypes.windll.user32.FindWindowW("Progman", None)
+    if progman:
+        folder, result, _ = i.explorer_folder(progman)
+        assert result == i.FOLDER_OK and os.path.isdir(folder)
+    folder, result, detail = i.explorer_folder(0x7FFFFFF0)  # not an Explorer window
+    assert result == i.LOOKUP_FAILED and folder is None, detail
+
+
+def test_log_writes(tmp_path, monkeypatch):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    from swiftcopy import log
+    log.log("hello")
+    assert "hello" in open(log.log_path(), encoding="utf-8").read()

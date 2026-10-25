@@ -43,13 +43,23 @@ jobs:
           pyinstaller --noconfirm --clean --onedir --windowed
           --name SwiftCopy --icon assets/icon.ico
           --add-data "assets;assets"
+          --hidden-import win32com.client --hidden-import pythoncom --hidden-import pywintypes
           run_swiftcopy.py
+
+      - name: Self-test the packaged app (Explorer folder lookup + Ctrl+V hook)
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP "selftest.json"
+          $p = Start-Process -FilePath "dist\SwiftCopy\SwiftCopy.exe" -ArgumentList "--selftest", "`"$out`"" -Wait -PassThru
+          Get-Content $out
+          if ($p.ExitCode -ne 0) { Write-Error "packaged self-test failed"; exit 1 }
 
       - name: Build portable exe
         run: >
           pyinstaller --noconfirm --onefile --windowed
           --name SwiftCopy-Portable --icon assets/icon.ico
           --add-data "assets;assets"
+          --hidden-import win32com.client --hidden-import pythoncom --hidden-import pywintypes
           run_swiftcopy.py
 
       - name: Build installer

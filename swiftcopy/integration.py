@@ -129,45 +129,66 @@ def desktop_dir() -> str:
 EXPLORER_CLASSES = {"CabinetWClass", "ExploreWClass"}
 DESKTOP_CLASSES = {"Progman", "WorkerW"}
 # Only take over when the focus is on the file list itself - never while typing
-# in the address bar, search box or a rename box.
-FILE_VIEW_FOCUS = {"DirectUIHWND", "SysListView32"}
+# in the address bar, search box or a rename box (those are Edit / XAML windows).
+FILE_VIEW_FOCUS = {"DirectUIHWND", "SysListView32", "SHELLDLL_DefView"}
+
+# explorer_folder() results
+FOLDER_OK = "ok"            # a normal folder - SwiftCopy handles it
+NOT_A_FOLDER = "special"    # This PC, Recycle Bin, a phone, a zip... - let Windows do it
+LOOKUP_FAILED = "failed"    # couldn't ask Explorer - SwiftCopy asks the user instead
 
 
-def explorer_folder(root_hwnd: int) -> str | None:
-    """Folder shown in the Explorer window (active tab), or None if it isn't a real folder."""
+def explorer_folder(root_hwnd: int) -> tuple[str | None, str, str]:
+    """(folder, result, detail) for the folder shown in an Explorer window's active tab."""
     if not IS_WIN:
-        return None
+        return None, LOOKUP_FAILED, "not Windows"
     import ctypes
     cls = _class_name(root_hwnd)
     if cls in DESKTOP_CLASSES:
-        return desktop_dir()
+        return desktop_dir(), FOLDER_OK, "desktop"
     try:
+        import pythoncom
         import win32com.client  # pywin32
-    except ImportError:
-        return None
+    except Exception as e:  # noqa: BLE001
+        return None, LOOKUP_FAILED, f"pywin32 not available: {e!r}"
+    try:
+        pythoncom.CoInitialize()
+    except Exception:  # noqa: BLE001 - already initialised on this thread
+        pass
     title_buf = ctypes.create_unicode_buffer(512)
     ctypes.windll.user32.GetWindowTextW(root_hwnd, title_buf, 512)
     title = title_buf.value
-    matches = []
+    matches, seen = [], 0
     try:
-        for w in win32com.client.Dispatch("Shell.Application").Windows():
+        windows = win32com.client.Dispatch("Shell.Application").Windows()
+        for i in range(windows.Count):
             try:
+                w = windows.Item(i)
+                if w is None:
+                    continue
+                seen += 1
                 if int(w.HWND) != int(root_hwnd):
                     continue
-                matches.append((str(w.LocationName), str(w.Document.Folder.Self.Path)))
-            except Exception:  # noqa: BLE001 - non-folder views, closing windows
+                try:
+                    path = str(w.Document.Folder.Self.Path)
+                except Exception:  # noqa: BLE001 - not a folder view
+                    path = ""
+                matches.append((str(w.LocationName), path))
+            except Exception:  # noqa: BLE001 - a window closing while we look
                 continue
-    except Exception:  # noqa: BLE001
-        return None
+    except Exception as e:  # noqa: BLE001
+        return None, LOOKUP_FAILED, f"Shell.Application error: {e!r}"
     if not matches:
-        return None
-    path = matches[0][1]
+        return None, LOOKUP_FAILED, f"window not found among {seen} Explorer windows (title {title!r})"
+    name, path = matches[0]
     if len(matches) > 1:  # Windows 11 tabs share one window; the title names the active tab
-        for name, p in matches:
-            if title == name or title.startswith(name + " - "):
-                path = p
+        for n, p in matches:
+            if title == n or title.startswith(n + " - "):
+                name, path = n, p
                 break
-    return path if os.path.isdir(path) else None
+    if path and os.path.isdir(path):
+        return path, FOLDER_OK, f"tab {name!r}"
+    return None, NOT_A_FOLDER, f"tab {name!r} is not a normal folder ({path!r})"
 
 
 def _class_name(hwnd) -> str:
@@ -178,28 +199,56 @@ def _class_name(hwnd) -> str:
 
 
 class PasteHook:
-    """Low-level keyboard hook that catches Ctrl+V in File Explorer / on the desktop
-    when the clipboard holds files, and hands the paste to `on_paste(root_hwnd)`.
+    """Catches Ctrl+V in File Explorer / on the desktop when the clipboard holds files
+    and calls `notify(root_hwnd)` (from the hook thread - make it thread-safe, e.g. a Qt
+    signal). Explorer never sees that Ctrl+V.
 
-    `on_paste` runs later on the Qt thread (via `schedule`). If SwiftCopy can't
-    handle the paste it calls `send_native_paste()` so Explorer pastes as usual.
-    Must be installed from the GUI thread (it needs that thread's message loop).
+    The hook lives on its own thread with its own message loop, so a busy SwiftCopy
+    window can never make Windows time it out, and it is re-armed every 30 seconds in
+    case Windows dropped it anyway (it does that silently, e.g. after sleep).
     """
 
-    def __init__(self, on_paste, schedule):
-        self.on_paste = on_paste
-        self.schedule = schedule
-        self._hook = None
-        self._proc = None
+    REARM_MS = 30_000
+
+    def __init__(self, notify):
+        self.notify = notify
+        self._thread = None
+        self._thread_id = 0
+        self._ready = None
+        self._ok = False
         self._holding_v = False
+        self.last_decision = ""
+        self.armed_count = 0
 
     @property
     def active(self) -> bool:
-        return self._hook is not None
+        return self._ok and self._thread is not None and self._thread.is_alive()
 
     def install(self) -> bool:
-        if not IS_WIN or self._hook:
-            return bool(self._hook)
+        if not IS_WIN:
+            return False
+        if self.active:
+            return True
+        import threading
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="SwiftCopy-PasteHook", daemon=True)
+        self._thread.start()
+        self._ready.wait(3)
+        return self.active
+
+    def uninstall(self) -> None:
+        if self._thread is not None and self._thread.is_alive() and self._thread_id:
+            import ctypes
+            ctypes.windll.user32.PostThreadMessageW(self._thread_id, 0x0012, 0, 0)  # WM_QUIT
+            self._thread.join(2)
+        self._thread = None
+        self._ok = False
+
+    def _decide(self, msg: str) -> None:
+        self.last_decision = msg
+        _log(msg)
+
+    def _run(self) -> None:  # noqa: C901 - one self-contained Win32 thread
         import ctypes
         from ctypes import wintypes
 
@@ -235,10 +284,13 @@ class PasteHook:
         user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
         user32.GetAsyncKeyState.restype = ctypes.c_short
         user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+        user32.SetTimer.argtypes = [wintypes.HWND, ctypes.c_size_t, wintypes.UINT, ctypes.c_void_p]
+        user32.SetTimer.restype = ctypes.c_size_t
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT]
         kernel32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
         kernel32.GetModuleHandleW.restype = wintypes.HMODULE
 
-        WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN = 13, 0x100, 0x101, 0x104
+        WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_TIMER = 13, 0x100, 0x101, 0x104, 0x113
         VK_V, LLKHF_INJECTED, CF_HDROP = 0x56, 0x10, 15
         VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN = 0x11, 0x10, 0x12, 0x5B, 0x5C
 
@@ -250,24 +302,26 @@ class PasteHook:
             user32.GetClassNameW(hwnd, buf, 256)
             return buf.value
 
-        def wants_paste():
+        def check_target():
+            """(root_hwnd or None, reason)."""
             fg = user32.GetForegroundWindow()
             if not fg:
-                return None
+                return None, "no foreground window"
             root = user32.GetAncestor(fg, 2) or fg  # GA_ROOT
             root_cls = cls(root)
             if root_cls not in EXPLORER_CLASSES and root_cls not in DESKTOP_CLASSES:
-                return None
+                return None, None  # not Explorer - not our business, don't log
             info = GUITHREADINFO()
             info.cbSize = ctypes.sizeof(GUITHREADINFO)
             tid = user32.GetWindowThreadProcessId(fg, None)
-            if not user32.GetGUIThreadInfo(tid, ctypes.byref(info)) or not info.hwndFocus:
-                return None
-            if cls(info.hwndFocus) not in FILE_VIEW_FOCUS:
-                return None
+            focus_cls = ""
+            if user32.GetGUIThreadInfo(tid, ctypes.byref(info)) and info.hwndFocus:
+                focus_cls = cls(info.hwndFocus)
+            if focus_cls not in FILE_VIEW_FOCUS:
+                return None, f"Explorer focus is on {focus_cls or 'nothing'!r} (not the file list) - left to Windows"
             if not user32.IsClipboardFormatAvailable(CF_HDROP):
-                return None
-            return int(root)
+                return None, "clipboard has no files - left to Windows"
+            return int(root), f"taken: Explorer window {root_cls}, focus {focus_cls}"
 
         def proc(n_code, w_param, l_param):
             try:
@@ -279,31 +333,58 @@ class PasteHook:
                                 return 1  # auto-repeat of a paste we already took
                             if (down(VK_CONTROL) and not down(VK_SHIFT) and not down(VK_MENU)
                                     and not down(VK_LWIN) and not down(VK_RWIN)):
-                                root = wants_paste()
+                                root, why = check_target()
+                                if why:
+                                    self._decide("Ctrl+V " + why)
                                 if root:
                                     self._holding_v = True
-                                    self.schedule(lambda r=root: self.on_paste(r))
+                                    self.notify(root)
                                     return 1  # Explorer never sees this Ctrl+V
                         elif w_param == WM_KEYUP and self._holding_v:
                             self._holding_v = False
-            except Exception:  # noqa: BLE001 - a hook must never raise
-                pass
+            except Exception as e:  # noqa: BLE001 - a hook must never raise
+                _log(f"hook error: {e!r}")
             return user32.CallNextHookEx(None, n_code, w_param, l_param)
 
-        self._proc = HOOKPROC(proc)  # keep a reference or it gets garbage-collected
-        self._user32 = user32
-        self._hook = user32.SetWindowsHookExW(WH_KEYBOARD_LL, self._proc,
-                                              kernel32.GetModuleHandleW(None), 0)
-        if not self._hook:
-            self._proc = None
-            return False
-        return True
+        cb = HOOKPROC(proc)  # must stay referenced for the life of the hook
+        hmod = kernel32.GetModuleHandleW(None)
 
-    def uninstall(self) -> None:
-        if self._hook:
-            self._user32.UnhookWindowsHookEx(self._hook)
-            self._hook = None
-            self._proc = None
+        def arm(old):
+            if old:
+                user32.UnhookWindowsHookEx(old)
+            h = user32.SetWindowsHookExW(WH_KEYBOARD_LL, cb, hmod, 0)
+            if not h:
+                _log(f"SetWindowsHookEx failed, error {ctypes.get_last_error()}")
+            else:
+                self.armed_count += 1
+            return h
+
+        self._thread_id = kernel32.GetCurrentThreadId()
+        hook = arm(None)
+        self._ok = bool(hook)
+        if self._ok:
+            _log("Ctrl+V takeover is on")
+        self._ready.set()
+        if not hook:
+            return
+        user32.SetTimer(None, 0, self.REARM_MS, None)
+        msg = wintypes.MSG()
+        try:
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == WM_TIMER:
+                    hook = arm(hook) or hook  # Windows may have dropped it silently
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            if hook:
+                user32.UnhookWindowsHookEx(hook)
+            self._ok = False
+            _log("Ctrl+V takeover is off")
+
+
+def _log(msg: str) -> None:
+    from .log import log
+    log(msg)
 
 
 def send_native_paste() -> None:

@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import APP_NAME, __version__, integration, shell, theme
+from .log import log, log_path
 from .dialogs import CollisionDialog, ErrorDialog
 from .engine import (
     Collision, CopyEngine, ErrorAction, FINAL_STATES, Settings, Status, format_eta, format_size,
@@ -465,6 +466,7 @@ def group(title: str | None = None, sub: str | None = None) -> tuple[QFrame, QVB
 
 
 class MainWindow(QMainWindow):
+    paste_requested = Signal(int)
     PAGES = ["New transfer", "Queue", "Problems", "Settings"]
 
     def __init__(self, icon: QIcon):
@@ -497,8 +499,9 @@ class MainWindow(QMainWindow):
             self.tray.show()
 
         # Ctrl+V in File Explorer goes through SwiftCopy
-        self.paste_hook = integration.PasteHook(
-            self.explorer_paste, lambda fn: QTimer.singleShot(0, fn))
+        # the hook runs on its own thread; this signal brings each paste back to the window's thread
+        self.paste_requested.connect(self.explorer_paste, Qt.QueuedConnection)
+        self.paste_hook = integration.PasteHook(self.paste_requested.emit)
         if integration.IS_WIN and _truthy(self.store.value("intercept_paste", True)):
             self.paste_hook.install()
         if integration.IS_WIN and integration.frozen():
@@ -920,8 +923,25 @@ class MainWindow(QMainWindow):
         self.int_sendto.toggled.connect(self._toggle_sendto)
         self.int_startup.toggled.connect(lambda on: self._apply_integration(integration.set_autostart, on))
         self.int_tray.toggled.connect(lambda on: self.store.setValue("keep_in_tray", on))
-        gl.addWidget(label("Ctrl+V only goes through SwiftCopy while it's running. Dragging files "
-                           "with the mouse still uses Windows' own copy.", "muted", wrap=True))
+        gl.addWidget(label("SwiftCopy takes over Ctrl+V only. Dragging files with the mouse, and "
+                           "Paste from Explorer's own right-click menu or toolbar, still use Windows' "
+                           "copy — use right-click → Paste with SwiftCopy for those.", "muted", wrap=True))
+        lay.addWidget(g)
+
+        g, gl = group("Troubleshooting")
+        self.hook_status = label("", wrap=True)
+        gl.addWidget(self.hook_status)
+        self.hook_last = label("", "muted", wrap=True)
+        gl.addWidget(self.hook_last)
+        row = QHBoxLayout()
+        open_log = QPushButton("Open log")
+        open_log.clicked.connect(self.open_log)
+        rearm = QPushButton("Restart Ctrl+V takeover")
+        rearm.clicked.connect(self.restart_hook)
+        row.addWidget(open_log)
+        row.addWidget(rearm)
+        row.addStretch(1)
+        gl.addLayout(row)
         lay.addWidget(g)
         lay.addStretch(1)
         return outer_w
@@ -1023,6 +1043,42 @@ class MainWindow(QMainWindow):
         else:
             self.paste_hook.uninstall()
 
+    def open_log(self):
+        path = log_path()
+        if not os.path.exists(path):
+            log("log opened")
+        shell.open_in_explorer(path)
+
+    def restart_hook(self):
+        if not integration.IS_WIN:
+            return
+        self.paste_hook.uninstall()
+        ok = self.paste_hook.install()
+        self.int_paste.blockSignals(True)
+        self.int_paste.setChecked(ok)
+        self.int_paste.blockSignals(False)
+        self.store.setValue("intercept_paste", ok)
+        self.statusBar().showMessage("Ctrl+V takeover restarted." if ok else
+                                     "Windows didn't allow the Ctrl+V takeover. See the log.", 6000)
+
+    def _update_hook_status(self):
+        if not hasattr(self, "hook_status"):
+            return
+        if not integration.IS_WIN:
+            self.hook_status.setText("Ctrl+V takeover is only available on Windows.")
+            self.hook_last.setText("")
+            return
+        if self.paste_hook.active:
+            self.hook_status.setText("Ctrl+V takeover is running.")
+        elif self.int_paste.isChecked():
+            self.hook_status.setText("Ctrl+V takeover should be on but isn't running. "
+                                     "Press Restart, and send the log if it keeps happening.")
+        else:
+            self.hook_status.setText("Ctrl+V takeover is turned off.")
+        last = self.paste_hook.last_decision
+        self.hook_last.setText(f"Last Ctrl+V in Explorer: {last}" if last else
+                               "No Ctrl+V in Explorer yet since SwiftCopy started.")
+
     # ---------------------------------------------------------------- sources
     def add_files(self):
         files, _ = QFileDialog.getOpenFileNames(self, "Add files")
@@ -1050,11 +1106,24 @@ class MainWindow(QMainWindow):
 
     def explorer_paste(self, root_hwnd: int):
         """Ctrl+V caught in File Explorer: copy the clipboard files into that folder."""
-        folder = integration.explorer_folder(root_hwnd)
+        folder, result, detail = integration.explorer_folder(root_hwnd)
         paths, cut = clipboard_files()
-        if not folder or not paths:
-            integration.send_native_paste()  # not a normal folder - let Explorer do it
+        if not paths:
+            log(f"paste: clipboard had no files after all ({detail}) - handed to Windows")
+            integration.send_native_paste()
             return
+        if result == integration.NOT_A_FOLDER:
+            log(f"paste: {detail} - handed to Windows")
+            integration.send_native_paste()  # This PC, a phone, a zip... Windows handles those
+            return
+        if result == integration.LOOKUP_FAILED:
+            # Don't silently give the paste back to Windows - let the user pick the folder.
+            log(f"paste: couldn't read Explorer's folder ({detail}) - asking in SwiftCopy")
+            self.set_sources(paths)
+            self.statusBar().showMessage("SwiftCopy couldn't tell which folder Explorer is showing. "
+                                         "Choose where to copy, then press Copy or Move.", 12000)
+            return
+        log(f"paste: {len(paths)} item(s) {'moved' if cut else 'copied'} into {folder} ({detail})")
         self.engine.add_job(paths, folder, move=cut)
         if cut:
             QApplication.clipboard().clear()  # same as Explorer: cut files paste once
@@ -1295,6 +1364,8 @@ class MainWindow(QMainWindow):
             self.hook_lbl.hide()
 
         self.setWindowTitle(f"{frac * 100:.0f}% · {APP_NAME}" if running else APP_NAME)
+        if self.stack.currentIndex() == 3:
+            self._update_hook_status()
         if len(self.engine.errors) != self._error_rows:
             self._fill_errors()
 
