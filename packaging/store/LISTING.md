@@ -55,6 +55,12 @@ Make it yours with seven themes: Midnight, Daylight, Windows XP, Windows Vista, 
 
 SwiftCopy works entirely on your PC. No account, no ads, no tracking, and it never connects to the internet.
 
+### What's new in this version (1.4.0)
+
+- Much faster with big folders: copying thousands of files is up to 10× quicker
+- The window stays smooth during large copies (fixed a freeze on big jobs)
+- Ctrl+V in File Explorer responds instantly, even when Explorer is busy
+
 ### Short description
 
 Fast file copying with a queue, pause and resume, and smart handling of existing files.

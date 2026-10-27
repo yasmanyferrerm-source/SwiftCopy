@@ -214,6 +214,18 @@ class CopyEngine:
         self._throttle_start = 0.0
         self._throttle_bytes = 0
         self.last_summary: dict = {}
+        # Running totals so the window never has to walk the whole list (that froze it
+        # on big copies). Recounted from scratch only after rare bulk changes.
+        self.version = 0            # bumps whenever items are removed or reordered
+        self._cursor = 0            # every item before this index is already finished
+        self.current_index = -1     # position of the file being copied, for the queue view
+        self._tot_bytes = 0
+        self._tot_files = 0
+        self._done_bytes = 0
+        self._done_files = 0
+        self._final_count = 0
+        self._made_dirs: set = set()
+        self._buf: Optional[memoryview] = None
 
     # ------------------------------------------------------------- public API
     def add_job(self, sources: list, dest: str, move: bool = False) -> int:
@@ -253,6 +265,7 @@ class CopyEngine:
             for it in self.items:
                 if it.status == Status.PENDING:
                     it.status = Status.CANCELLED
+            self._recount()
             if self.is_running:
                 self._cancel = True
             p = self.prompt
@@ -278,9 +291,17 @@ class CopyEngine:
         with self._lock:
             self.items = [it for it in self.items
                           if not (it.id in ids and it.status == Status.PENDING)]
+            self._structure_changed()
+
+    def pending_count(self) -> int:
+        """Items still waiting (not counting the one being copied right now)."""
+        with self._lock:
+            cur = self._current
+            busy = 1 if cur is not None and cur.status not in FINAL_STATES else 0
+            return max(len(self.items) - self._final_count - busy, 0)
 
     def items_pending(self) -> bool:
-        return any(it.status == Status.PENDING for it in self.items)
+        return self.pending_count() > 0
 
     def take_failed(self) -> list[TransferItem]:
         """Remove failed file items from the list (so they can be re-queued)."""
@@ -289,12 +310,60 @@ class CopyEngine:
             ids = {it.id for it in failed}
             self.items = [it for it in self.items if it.id not in ids]
             self.errors.clear()
+            self._structure_changed()
         return failed
 
     def clear_finished(self) -> None:
         with self._lock:
             self.items = [it for it in self.items if it.status not in FINAL_STATES]
             self.errors.clear()
+            self._structure_changed()
+
+    def _structure_changed(self) -> None:
+        """Items were removed or reordered: recount and let the queue view reload."""
+        self.version += 1
+        self._cursor = 0
+        cur = self._current
+        self.current_index = -1
+        if cur is not None:
+            for i, it in enumerate(self.items):
+                if it is cur:
+                    self.current_index = i
+                    break
+        self._recount()
+
+    def _recount(self) -> None:
+        tb = tf = db = df = fc = 0
+        for it in self.items:
+            tb += it.size
+            if not it.is_dir:
+                tf += 1
+            if it.status in FINAL_STATES:
+                fc += 1
+                if it.status != Status.CANCELLED:
+                    db += it.size
+                    if not it.is_dir:
+                        df += 1
+        self._tot_bytes, self._tot_files = tb, tf
+        self._done_bytes, self._done_files, self._final_count = db, df, fc
+
+    def _set_final(self, item: TransferItem, status: Status) -> None:
+        """Move an item to a finished state and update the running totals."""
+        with self._lock:
+            was = item.status
+            if was not in FINAL_STATES:
+                self._final_count += 1
+            counted = was in FINAL_STATES and was != Status.CANCELLED
+            counts = status != Status.CANCELLED
+            if counts and not counted:
+                self._done_bytes += item.size
+                if not item.is_dir:
+                    self._done_files += 1
+            elif counted and not counts:
+                self._done_bytes -= item.size
+                if not item.is_dir:
+                    self._done_files -= 1
+            item.status = status
 
     def move_items(self, ids: set, direction: int) -> None:
         """Move pending items up (-1) or down (+1) in the queue."""
@@ -307,25 +376,16 @@ class CopyEngine:
                 if 0 <= j < len(self.items) and self.items[j].status == Status.PENDING \
                         and self.items[j].id not in ids:
                     self.items[i], self.items[j] = self.items[j], self.items[i]
+            self._structure_changed()
 
     def snapshot(self) -> dict:
+        """Progress figures - O(1), safe to call many times a second."""
         with self._lock:
-            items = list(self.items)
             cur = self._current
-        total = done_bytes = 0
-        files_total = files_done = 0
-        for it in items:
-            total += it.size
-            if not it.is_dir:
-                files_total += 1
-            if it.status == Status.CANCELLED:
-                continue  # counts toward the total but never toward "done"
-            if it.status in FINAL_STATES:
-                done_bytes += it.size
-                if not it.is_dir:
-                    files_done += 1
-            else:
-                done_bytes += it.done
+            total, files_total = self._tot_bytes, self._tot_files
+            done_bytes, files_done = self._done_bytes, self._done_files
+            if cur is not None and cur.status not in FINAL_STATES:
+                done_bytes += cur.done
         speed = self._speed()
         remaining = max(total - done_bytes, 0)
         eta = remaining / speed if speed > 1 else None
@@ -372,10 +432,11 @@ class CopyEngine:
                     self._process(item)
                 except _CancelAll:
                     if item.status not in FINAL_STATES:
-                        item.status = Status.CANCELLED
+                        self._set_final(item, Status.CANCELLED)
                     self._after_cancel()
                 finally:
-                    self._current = None
+                    with self._lock:
+                        self._current = None
             self._prune_moved_dirs()
         finally:
             with self._lock:
@@ -403,6 +464,7 @@ class CopyEngine:
             for it in self.items:
                 if it.status in (Status.PENDING, Status.COPYING, Status.VERIFYING):
                     it.status = Status.CANCELLED
+            self._recount()
             self._jobs.clear()
             self._finished_moves.clear()
             self._cancel = False
@@ -410,11 +472,22 @@ class CopyEngine:
         self._unpaused.set()
 
     def _next_pending(self) -> Optional[TransferItem]:
+        # Resume from where the last search stopped instead of from the top: searching
+        # from the start for every file made big copies slower and slower (and froze the window).
         with self._lock:
-            for it in self.items:
+            items = self.items
+            i = self._cursor
+            n = len(items)
+            while i < n:
+                it = items[i]
                 if it.status == Status.PENDING:
+                    self._cursor = i
+                    self.current_index = i
                     self._current = it
                     return it
+                i += 1
+            self._cursor = n
+            self.current_index = -1
         return None
 
     # ------------------------------------------------------------------ scan
@@ -424,6 +497,15 @@ class CopyEngine:
                           is_dir=is_dir, status=status, error=error)
         with self._lock:
             self.items.append(it)
+            self._tot_bytes += size
+            if not is_dir:
+                self._tot_files += 1
+            if status in FINAL_STATES:
+                self._final_count += 1
+                if status != Status.CANCELLED:
+                    self._done_bytes += size
+                    if not is_dir:
+                        self._done_files += 1
             if status == Status.ERROR:
                 self.errors.append((src, error))
 
@@ -487,8 +569,8 @@ class CopyEngine:
         if item.is_dir:
             try:
                 os.makedirs(lp(item.dst), exist_ok=True)
-                item.status = Status.DONE
                 item.final_dst = item.dst
+                self._set_final(item, Status.DONE)
             except OSError as e:
                 self._fail(item, e)
             return
@@ -501,14 +583,14 @@ class CopyEngine:
             try:
                 target = self._resolve_collision(item)
                 if target is None:
-                    item.status = Status.SKIPPED
+                    self._set_final(item, Status.SKIPPED)
                     return
                 self._transfer(item, target)
                 item.final_dst = target
-                item.status = Status.DONE
+                self._set_final(item, Status.DONE)
                 return
             except _SkipFile:
-                item.status = Status.SKIPPED
+                self._set_final(item, Status.SKIPPED)
                 return
             except _CancelAll:
                 raise
@@ -528,8 +610,8 @@ class CopyEngine:
 
     def _fail(self, item: TransferItem, exc: BaseException) -> None:
         msg = getattr(exc, "strerror", None) or str(exc) or exc.__class__.__name__
-        item.status = Status.ERROR
         item.error = msg
+        self._set_final(item, Status.ERROR)
         with self._lock:
             self.errors.append((item.src, msg))
 
@@ -664,9 +746,22 @@ class CopyEngine:
         if wait > 0:
             self._sleep(wait)
 
+    def _ensure_dir(self, folder: str) -> None:
+        if folder not in self._made_dirs:
+            os.makedirs(lp(folder), exist_ok=True)
+            if len(self._made_dirs) > 20000:
+                self._made_dirs.clear()
+            self._made_dirs.add(folder)
+
+    def _buffer(self) -> memoryview:
+        size = max(64, self.settings.buffer_kb) * 1024
+        if self._buf is None or len(self._buf) != size:
+            self._buf = memoryview(bytearray(size))
+        return self._buf
+
     def _transfer(self, item: TransferItem, target: str) -> None:
         folder = os.path.dirname(target)
-        os.makedirs(lp(folder), exist_ok=True)
+        self._ensure_dir(folder)
 
         # Fast path: move on the same drive is just a rename.
         if item.move and not self.settings.verify:
@@ -684,25 +779,27 @@ class CopyEngine:
                 return
 
         part = target + PART_SUFFIX
-        bufsize = max(64, self.settings.buffer_kb) * 1024
+        buf = self._buffer()
         hasher = hashlib.blake2b(digest_size=32) if self.settings.verify else None
         try:
-            with open(lp(item.src), "rb") as fi, open(lp(part), "wb") as fo:
+            with open(lp(item.src), "rb", buffering=0) as fi, open(lp(part), "wb", buffering=0) as fo:
+                st = os.fstat(fi.fileno())
                 while True:
                     self._check()
-                    chunk = fi.read(bufsize)
-                    if not chunk:
+                    n = fi.readinto(buf)
+                    if not n:
                         break
-                    fo.write(chunk)
+                    chunk = buf[:n]
+                    while chunk:  # unbuffered writes may be partial
+                        w = fo.write(chunk)
+                        chunk = chunk[w:]
                     if hasher:
-                        hasher.update(chunk)
-                    n = len(chunk)
+                        hasher.update(buf[:n])
                     item.done += n
                     self._count(n)
                     self._throttle(n)
             if self.settings.keep_timestamps:
                 try:
-                    st = os.stat(lp(item.src))
                     os.utime(lp(part), ns=(st.st_atime_ns, st.st_mtime_ns))
                 except OSError:
                     pass
@@ -710,6 +807,7 @@ class CopyEngine:
                 _make_writable(target)
             os.replace(lp(part), lp(target))
         except BaseException:
+            self._made_dirs.discard(folder)  # e.g. the folder was deleted meanwhile
             try:
                 if os.path.lexists(lp(part)):
                     os.remove(lp(part))
@@ -720,13 +818,13 @@ class CopyEngine:
         if hasher:
             item.status = Status.VERIFYING
             check = hashlib.blake2b(digest_size=32)
-            with open(lp(target), "rb") as f:
+            with open(lp(target), "rb", buffering=0) as f:
                 while True:
                     self._check()
-                    chunk = f.read(bufsize)
-                    if not chunk:
+                    n = f.readinto(buf)
+                    if not n:
                         break
-                    check.update(chunk)
+                    check.update(buf[:n])
             if check.digest() != hasher.digest():
                 try:
                     os.remove(lp(target))

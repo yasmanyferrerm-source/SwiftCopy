@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import random
 import struct
+import sys
+import threading
 
 from PySide6.QtCore import (
     QAbstractTableModel, QModelIndex, QPointF, QRectF, QSettings, QSize, Qt, QTimer, Signal,
@@ -15,7 +17,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog, QFrame,
     QGridLayout, QHBoxLayout, QHeaderView, QLabel, QListWidget, QMainWindow, QMenu, QMessageBox,
     QProgressBar, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStackedWidget,
-    QStyledItemDelegate, QSystemTrayIcon, QTableView, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QStyle, QStyledItemDelegate, QSystemTrayIcon, QTableView, QTableWidget, QTableWidgetItem, QVBoxLayout,
     QWidget,
 )
 
@@ -365,15 +367,31 @@ class QueueModel(QAbstractTableModel):
         super().__init__()
         self.engine = engine
         self._rows: list = []
+        self._version = -1
 
     def refresh(self) -> None:
-        items = list(self.engine.items)
-        if len(items) != len(self._rows) or any(a is not b for a, b in zip(items, self._rows)):
+        """Sync with the engine cheaply: new files are appended, and the whole table
+        only reloads when files were removed or reordered (rare)."""
+        eng = self.engine
+        items = eng.items
+        if eng.version != self._version or len(items) < len(self._rows):
             self.beginResetModel()
-            self._rows = items
+            self._rows = list(items)
+            self._version = eng.version
             self.endResetModel()
-        elif items:
-            self.dataChanged.emit(self.index(0, 0), self.index(len(items) - 1, len(self.HEADERS) - 1))
+            return
+        old, new = len(self._rows), len(items)
+        if new > old:
+            self.beginInsertRows(QModelIndex(), old, new - 1)
+            self._rows.extend(items[old:new])
+            self.endInsertRows()
+
+    def touch_rows(self, first: int, last: int) -> None:
+        """Repaint only the rows on screen (not the whole list)."""
+        first = max(first, 0)
+        last = min(last, len(self._rows) - 1)
+        if first <= last:
+            self.dataChanged.emit(self.index(first, 0), self.index(last, len(self.HEADERS) - 1))
 
     def item_at(self, row: int):
         return self._rows[row] if 0 <= row < len(self._rows) else None
@@ -415,21 +433,62 @@ class QueueModel(QAbstractTableModel):
         return None
 
 
-class StatusDelegate(QStyledItemDelegate):
-    def initStyleOption(self, opt, index):
-        super().initStyleOption(opt, index)
-        it = index.data(Qt.UserRole)
-        if it is not None:
-            opt.text = "●  " + it.status.value
-            opt.palette.setColor(opt.palette.ColorRole.Text, status_color(it.status))
-            opt.palette.setColor(opt.palette.ColorRole.HighlightedText, status_color(it.status))
+class QueueDelegate(QStyledItemDelegate):
+    """Draws a whole queue cell in one Python call, reading the item directly.
+    (The default path asks the model for ~10 roles per cell, which made big queues sluggish.)"""
 
+    def __init__(self, model: "QueueModel", parent=None):
+        super().__init__(parent)
+        self.model = model
 
-class ProgressDelegate(QStyledItemDelegate):
     def paint(self, p, opt, index):
-        super().paint(p, opt, index)
-        it = index.data(Qt.UserRole)
-        if it is None or it.is_dir or it.status in (Status.PENDING, Status.CANCELLED):
+        it = self.model.item_at(index.row())
+        widget = opt.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawPrimitive(QStyle.PE_PanelItemViewItem, opt, p, widget)
+        if it is None:
+            return
+        t = theme.current
+        col = index.column()
+        rect = opt.rect.adjusted(8, 0, -8, 0)
+        selected = bool(opt.state & QStyle.State_Selected)
+        text_color = QColor(t["sel_text"] if selected else t["text"])
+        if col == 3:
+            self._bar(p, opt, it, t)
+            return
+        align = Qt.AlignVCenter | Qt.AlignLeft
+        elide = Qt.ElideRight
+        if col == 0:
+            p.save()
+            p.setRenderHint(QPainter.Antialiasing)
+            c = status_color(it.status)
+            p.setPen(Qt.NoPen)
+            p.setBrush(c)
+            cy = rect.center().y()
+            p.drawEllipse(QRectF(rect.left(), cy - 3.5, 7, 7))
+            p.restore()
+            rect = rect.adjusted(15, 0, 0, 0)
+            text, text_color = it.status.value, c
+        elif col == 1:
+            text = os.path.basename(it.src) + ("\\" if it.is_dir else "")
+        elif col == 2:
+            text = "" if it.is_dir else format_size(it.size)
+            align = Qt.AlignVCenter | Qt.AlignRight
+        elif col == 4:
+            text, elide = os.path.dirname(it.src), Qt.ElideMiddle
+        else:
+            text, elide = os.path.dirname(it.final_dst or it.dst), Qt.ElideMiddle
+        if not text:
+            return
+        p.save()
+        p.setFont(opt.font)
+        p.setPen(text_color)
+        p.drawText(rect, int(align), opt.fontMetrics.elidedText(text, elide, rect.width()))
+        p.restore()
+
+    @staticmethod
+    def _bar(p, opt, it, t):
+        if it.is_dir or it.status in (Status.PENDING, Status.CANCELLED):
             return
         if it.status == Status.DONE:
             frac = 1.0
@@ -437,7 +496,6 @@ class ProgressDelegate(QStyledItemDelegate):
             frac = it.done / it.size if it.size else 1.0
         else:
             return
-        t = theme.current
         r = QRectF(opt.rect).adjusted(8, opt.rect.height() / 2 - 3, -8, -(opt.rect.height() / 2 - 3))
         p.save()
         p.setRenderHint(QPainter.Antialiasing)
@@ -445,8 +503,7 @@ class ProgressDelegate(QStyledItemDelegate):
         p.setBrush(QColor(t["line"]))
         rad = min(t["radius"], 3)
         p.drawRoundedRect(r, rad, rad)
-        fill = QColor(t["ok"] if it.status == Status.DONE else (t["move"] if it.move else t["copy"]))
-        p.setBrush(fill)
+        p.setBrush(QColor(t["ok"] if it.status == Status.DONE else (t["move"] if it.move else t["copy"])))
         p.drawRoundedRect(QRectF(r.left(), r.top(), max(r.width() * frac, 3), r.height()), rad, rad)
         p.restore()
 
@@ -467,6 +524,7 @@ def group(title: str | None = None, sub: str | None = None) -> tuple[QFrame, QVB
 
 class MainWindow(QMainWindow):
     paste_requested = Signal(int)
+    paste_resolved = Signal(object, str, str, object, bool)
     PAGES = ["New transfer", "Queue", "Problems", "Settings"]
 
     def __init__(self, icon: QIcon):
@@ -477,6 +535,9 @@ class MainWindow(QMainWindow):
         self.resize(1080, 780)
         self.setMinimumSize(QSize(900, 640))
 
+        # The copy thread and the window share Python's interpreter lock. A shorter
+        # switch interval lets the window get its turn quickly, so it never looks frozen.
+        sys.setswitchinterval(0.001)
         self.store = QSettings(APP_NAME, APP_NAME)
         self.engine = CopyEngine(self._load_settings())
         self._showing_prompt = False
@@ -501,6 +562,7 @@ class MainWindow(QMainWindow):
         # Ctrl+V in File Explorer goes through SwiftCopy
         # the hook runs on its own thread; this signal brings each paste back to the window's thread
         self.paste_requested.connect(self.explorer_paste, Qt.QueuedConnection)
+        self.paste_resolved.connect(self._paste_resolved, Qt.QueuedConnection)
         self.paste_hook = integration.PasteHook(self.paste_requested.emit)
         if integration.IS_WIN and _truthy(self.store.value("intercept_paste", True)):
             self.paste_hook.install()
@@ -547,7 +609,7 @@ class MainWindow(QMainWindow):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
-        self.timer.start(200)
+        self.timer.start(250)
         self.tick()
 
     # ---------------------------------------------------------------- sidebar
@@ -585,6 +647,8 @@ class MainWindow(QMainWindow):
 
     def go(self, i: int):
         self.stack.setCurrentIndex(i)
+        if i == 1 and hasattr(self, "model"):
+            self.model.refresh()
         self.nav[i].setChecked(True)
         for b in self.nav:
             b._sync()
@@ -758,8 +822,8 @@ class MainWindow(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.setWordWrap(False)
         self.table.setTextElideMode(Qt.ElideMiddle)
-        self.table.setItemDelegateForColumn(0, StatusDelegate(self.table))
-        self.table.setItemDelegateForColumn(3, ProgressDelegate(self.table))
+        self.table.setItemDelegate(QueueDelegate(self.model, self.table))
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
         hh = self.table.horizontalHeader()
         hh.setHighlightSections(False)
         hh.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -987,6 +1051,7 @@ class MainWindow(QMainWindow):
     def showEvent(self, e):
         super().showEvent(e)
         theme.dark_title_bar(self, theme.current["dark"])
+        QTimer.singleShot(0, self.tick)  # catch up right away after being hidden in the tray
 
     # --------------------------------------------------------------- settings
     def _load_settings(self) -> Settings:
@@ -1119,9 +1184,20 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("These files were cut in Explorer, so Move is probably what you want.", 6000)
 
     def explorer_paste(self, root_hwnd: int):
-        """Ctrl+V caught in File Explorer: copy the clipboard files into that folder."""
-        folder, result, detail = integration.explorer_folder(root_hwnd)
-        paths, cut = clipboard_files()
+        """Ctrl+V caught in File Explorer: copy the clipboard files into that folder.
+        Asking Explorer for its folder can be slow, so that happens on a helper thread."""
+        paths, cut = clipboard_files()  # the clipboard must be read on the window's thread
+
+        def ask_explorer():
+            try:
+                folder, result, detail = integration.explorer_folder(root_hwnd)
+            except Exception as e:  # noqa: BLE001
+                folder, result, detail = None, integration.LOOKUP_FAILED, repr(e)
+            self.paste_resolved.emit(folder, result, detail, paths, cut)
+
+        threading.Thread(target=ask_explorer, name="SwiftCopy-ExplorerFolder", daemon=True).start()
+
+    def _paste_resolved(self, folder, result, detail, paths, cut):
         if not paths:
             log(f"paste: clipboard had no files after all ({detail}) - handed to Windows")
             integration.send_native_paste()
@@ -1277,13 +1353,32 @@ class MainWindow(QMainWindow):
 
     def tick(self):
         snap = self.engine.snapshot()
-        self.model.refresh()
         running = self.engine.is_running
+        if not self.isVisible() or self.isMinimized():
+            # Hidden in the tray: skip all drawing work, just keep the essentials going.
+            if self.tray:
+                total = snap["total_bytes"]
+                pct = snap["done_bytes"] / total * 100 if total else 0
+                self.tray.setToolTip(f"{APP_NAME}: {pct:.0f}%" if running else APP_NAME)
+            if self.engine.prompt is not None and not self._showing_prompt:
+                self._show_prompt()
+            if self._was_running and not running:
+                self._finished()
+            self._was_running = running
+            return
+        queue_visible = self.stack.currentIndex() == 1
+        if queue_visible:
+            self.model.refresh()
+            vp = self.table.viewport()
+            top = self.table.rowAt(0)
+            bottom = self.table.rowAt(vp.height() - 1)
+            if top >= 0:
+                self.model.touch_rows(top, bottom if bottom >= 0 else self.model.rowCount() - 1)
         summary = self.engine.last_summary or {}
         total, done = snap["total_bytes"], snap["done_bytes"]
         frac = done / total if total else 0.0
         cur = snap["current"]
-        pending = sum(1 for it in self.model._rows if it.status == Status.PENDING)
+        pending = self.engine.pending_count()
         self.hero.busy = running and not self.engine.is_paused
 
         if running:
@@ -1318,11 +1413,10 @@ class MainWindow(QMainWindow):
                 self.file_pct.setText(f"{format_size(cur.done)} of {format_size(cur.size)}")
                 if cur is not self._last_cur:
                     self._last_cur = cur
-                    if not self.table.selectionModel().hasSelection():
-                        for r, it in enumerate(self.model._rows):
-                            if it is cur:
-                                self.table.scrollTo(self.model.index(r, 0))
-                                break
+                    row = self.engine.current_index
+                    if (queue_visible and row >= 0 and row < self.model.rowCount()
+                            and not self.table.selectionModel().hasSelection()):
+                        self.table.scrollTo(self.model.index(row, 0))
             else:
                 self.detail.hide()
         else:
@@ -1368,13 +1462,15 @@ class MainWindow(QMainWindow):
             self.tray.setToolTip(f"{APP_NAME}: {frac * 100:.0f}%" if running else APP_NAME)
         self._update_buttons()
 
-        self.nav[1].set_badge(pending + (1 if running and cur is not None else 0))
+        self.nav[1].set_badge(pending + (1 if running and cur is not None and cur.status not in FINAL_STATES else 0))
         self.nav[2].set_badge(snap["errors"], bad=True)
         if integration.IS_WIN:
-            self.hook_lbl.setObjectName("hookOn" if self.paste_hook.active else "sideNote")
-            self.hook_lbl.setText("● Ctrl+V in Explorer uses SwiftCopy" if self.paste_hook.active
-                                  else "Ctrl+V takeover is off")
-            repolish(self.hook_lbl)
+            name = "hookOn" if self.paste_hook.active else "sideNote"
+            if self.hook_lbl.objectName() != name:
+                self.hook_lbl.setObjectName(name)
+                self.hook_lbl.setText("● Ctrl+V in Explorer uses SwiftCopy" if self.paste_hook.active
+                                      else "Ctrl+V takeover is off")
+                repolish(self.hook_lbl)
         else:
             self.hook_lbl.hide()
 
@@ -1392,13 +1488,20 @@ class MainWindow(QMainWindow):
         self._was_running = running
 
     def _fill_errors(self):
-        errs = list(self.engine.errors)
-        self._error_rows = len(errs)
-        self.err_table.setRowCount(len(errs))
-        for r, (src, msg) in enumerate(errs):
+        errs = self.engine.errors
+        n = len(errs)
+        start = self._error_rows if n >= self._error_rows else 0
+        if start == 0:
+            self.err_table.setRowCount(0)
+        self.err_table.setUpdatesEnabled(False)
+        self.err_table.setRowCount(n)
+        for r in range(start, n):
+            src, msg = errs[r]
             self.err_table.setItem(r, 0, QTableWidgetItem(src))
             self.err_table.setItem(r, 1, QTableWidgetItem(msg))
-        has = bool(errs)
+        self.err_table.setUpdatesEnabled(True)
+        self._error_rows = n
+        has = n > 0
         self.err_table.setVisible(has)
         self.err_empty.setVisible(not has)
         self.retry_btn.setEnabled(has)

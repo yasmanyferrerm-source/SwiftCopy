@@ -261,3 +261,77 @@ def test_unique_name(tmp_path):
     write(str(tmp_path / "r.pdf"))
     write(str(tmp_path / "r (2).pdf"))
     assert unique_name(str(tmp_path / "r.pdf")).endswith("r (3).pdf")
+
+
+def _totals_by_walking(e):
+    """What snapshot() used to compute by walking every item (the slow way)."""
+    tb = tf = db = df = 0
+    for it in e.items:
+        tb += it.size
+        tf += 0 if it.is_dir else 1
+        if it.status in (Status.DONE, Status.SKIPPED, Status.ERROR):
+            db += it.size
+            df += 0 if it.is_dir else 1
+    return tb, tf, db, df
+
+
+def test_running_totals_match_after_changes(tmp_path):
+    srcs = [write(str(tmp_path / "s" / f"{n}.txt"), b"x" * (n + 1)) for n in range(30)]
+    write(str(tmp_path / "d" / "3.txt"), b"old")
+    e = CopyEngine(Settings(collision=Collision.SKIP))
+    e.pause()
+    e.add_job(srcs + [str(tmp_path / "missing.txt")], str(tmp_path / "d"))
+    deadline = time.time() + 5
+    while len(e.items) < 31 and time.time() < deadline:
+        time.sleep(0.02)
+    pending = [i for i in e.items if i.status == Status.PENDING]
+    e.move_items({pending[-1].id}, -1)
+    e.remove_items({pending[2].id, pending[5].id})
+    e.resume()
+    assert e.wait(10)
+    s = e.snapshot()
+    tb, tf, db, df = _totals_by_walking(e)
+    assert (s["total_bytes"], s["files_total"], s["done_bytes"], s["files_done"]) == (tb, tf, db, df)
+    assert s["files_done"] == s["files_total"] == 29  # 28 copied/skipped + 1 missing (error)
+    assert e.pending_count() == 0
+    e.clear_finished()
+    s = e.snapshot()
+    assert (s["total_bytes"], s["files_total"], s["done_bytes"]) == (0, 0, 0)
+
+
+def test_totals_after_cancel(tmp_path):
+    srcs = [write(str(tmp_path / "s" / f"{n}.bin"), os.urandom(200_000)) for n in range(10)]
+    e = CopyEngine(Settings(buffer_kb=64, speed_limit_kbps=800))
+    e.add_job(srcs, str(tmp_path / "d"))
+    time.sleep(0.5)
+    e.cancel_all()
+    assert e.wait(10)
+    s = e.snapshot()
+    tb, tf, db, df = _totals_by_walking(e)
+    assert (s["total_bytes"], s["files_total"], s["done_bytes"], s["files_done"]) == (tb, tf, db, df)
+    assert s["files_done"] < s["files_total"]
+    assert e.pending_count() == 0
+
+
+def test_big_queue_stays_fast(tmp_path):
+    """Thousands of small files: the per-file cost must not grow with the list (it froze the app)."""
+    src = tmp_path / "many"
+    for d in range(10):
+        (src / f"d{d}").mkdir(parents=True)
+    for i in range(6000):
+        (src / f"d{i % 10}" / f"f{i}.txt").write_bytes(b"x")
+    e = CopyEngine()
+    t = time.monotonic()
+    e.add_job([str(src)], str(tmp_path / "out"))
+    calls = []
+    while e.is_running:
+        t0 = time.perf_counter()
+        e.snapshot()
+        e.pending_count()
+        calls.append(time.perf_counter() - t0)
+        time.sleep(0.01)
+    assert e.wait(60)
+    took = time.monotonic() - t
+    assert e.snapshot()["files_done"] == 6000
+    assert took < 30, took
+    assert max(calls) < 0.05, max(calls)  # progress figures stay instant
