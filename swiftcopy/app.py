@@ -6,6 +6,7 @@ import getpass
 import json
 import os
 import sys
+import time
 
 from PySide6.QtCore import QByteArray, QSettings
 from PySide6.QtGui import QIcon
@@ -36,11 +37,8 @@ def parse_args(argv):
 
 
 def server_name() -> str:
-    try:
-        user = getpass.getuser()
-    except Exception:  # noqa: BLE001
-        user = "user"
-    return f"{APP_NAME}-{user}"
+    from .integration import pipe_name
+    return pipe_name()
 
 
 def send_to_running(payload: dict) -> bool:
@@ -78,9 +76,15 @@ def selftest(path: str) -> int:
     hook = integration.PasteHook(lambda hwnd: None)
     out["hook"] = hook.install()
     hook.uninstall()
+    from .helperproc import HelperProcess
+    helper = HelperProcess("SwiftCopy-selftest")
+    out["helper"] = helper.install()
+    time.sleep(2)
+    out["helper_alive_after_2s"] = helper.active
+    helper.uninstall()
     with open(path, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=2)
-    return 0 if out["pywin32"] and out["hook"] else 1
+    return 0 if out["pywin32"] and out["hook"] and out["helper_alive_after_2s"] else 1
 
 
 def main(argv=None) -> int:
@@ -141,7 +145,12 @@ def main(argv=None) -> int:
                 data = json.loads(buf.decode("utf-8") or "{}")
             except ValueError:
                 return
-            if data.get("paths") or data.get("dest"):
+            kind = data.get("type")
+            if kind == "helper_status":  # what the Ctrl+V helper just did
+                win.paste_hook.last_decision = str(data.get("text", ""))
+            elif kind == "explorer_paste":  # Ctrl+V caught in File Explorer by the helper
+                win.helper_paste(data.get("paths") or [], data.get("dest"), bool(data.get("move")))
+            elif data.get("paths") or data.get("dest"):
                 win.set_sources(data.get("paths") or [], data.get("dest"), bool(data.get("move")),
                                 autostart=bool(data.get("dest")))
             elif data.get("show", True):

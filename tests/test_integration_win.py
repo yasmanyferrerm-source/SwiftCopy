@@ -77,3 +77,97 @@ def test_log_writes(tmp_path, monkeypatch):
     from swiftcopy import log
     log.log("hello")
     assert "hello" in open(log.log_path(), encoding="utf-8").read()
+
+
+def test_helper_process_starts_and_stops():
+    from swiftcopy.helperproc import HelperProcess
+    h = HelperProcess("SwiftCopy-test-helper")
+    assert h.install()
+    import time
+    time.sleep(2)
+    assert h.active, "helper closed by itself"
+    h.uninstall()
+    assert not h.active
+
+
+def test_helper_restarts_after_being_killed():
+    import time
+    from swiftcopy.helperproc import HelperProcess
+    h = HelperProcess("SwiftCopy-test-helper2")
+    assert h.install()
+    h.proc.kill()
+    h.proc.wait(5)
+    h.check()
+    time.sleep(1.5)
+    assert h.active and h.restarts == 1
+    h.uninstall()
+
+
+def test_helper_exits_when_parent_closes():
+    import subprocess, sys, time
+    from swiftcopy import helperproc
+    parent = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1)"])
+    cmd = helperproc.helper_command("SwiftCopy-test-helper3")
+    cmd[cmd.index("--parent") + 1] = str(parent.pid)
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = dict(os.environ, PYTHONPATH=root)
+    helper = subprocess.Popen(cmd, env=env)
+    parent.wait()
+    try:
+        helper.wait(25)  # checks every 15 s
+    except subprocess.TimeoutExpired:
+        helper.kill()
+        raise AssertionError("helper kept running after SwiftCopy closed")
+
+
+def test_helper_message_reaches_pipe():
+    import json, threading
+    import win32file, win32pipe
+    from swiftcopy import hookhelper
+    name = "SwiftCopy-test-pipe"
+    got = {}
+    pipe = win32pipe.CreateNamedPipe(r"\\.\pipe" + "\\" + name, win32pipe.PIPE_ACCESS_INBOUND,
+                                     win32pipe.PIPE_TYPE_BYTE | win32pipe.PIPE_WAIT, 1, 65536, 65536, 0, None)
+
+    def serve():
+        win32pipe.ConnectNamedPipe(pipe, None)
+        data = b""
+        while True:
+            try:
+                _, chunk = win32file.ReadFile(pipe, 65536)
+            except Exception:  # noqa: BLE001 - writer closed
+                break
+            data += chunk
+        got["msg"] = json.loads(data.decode("utf-8"))
+
+    t = threading.Thread(target=serve)
+    t.start()
+    assert hookhelper.send_to_app(name, {"type": "helper_status", "text": "hello"})
+    t.join(5)
+    win32file.CloseHandle(pipe)
+    assert got["msg"] == {"type": "helper_status", "text": "hello"}
+
+
+def test_clipboard_files_round_trip(tmp_path):
+    import struct
+    import pytest
+    import win32clipboard
+    from swiftcopy import hookhelper
+    f = tmp_path / "a.txt"
+    f.write_text("x")
+    files = (str(f) + "\0").encode("utf-16-le") + b"\0\0"
+    dropfiles = struct.pack("<IiiII", 20, 0, 0, 0, 1) + files
+    try:
+        win32clipboard.OpenClipboard()
+    except Exception:  # noqa: BLE001
+        pytest.skip("no clipboard on this machine")
+    try:
+        win32clipboard.EmptyClipboard()
+        win32clipboard.SetClipboardData(hookhelper.CF_HDROP, dropfiles)
+        effect = win32clipboard.RegisterClipboardFormat("Preferred DropEffect")
+        win32clipboard.SetClipboardData(effect, struct.pack("<I", 2))  # "cut"
+    finally:
+        win32clipboard.CloseClipboard()
+    paths, cut = hookhelper.read_clipboard_files()
+    assert [os.path.normcase(p) for p in paths] == [os.path.normcase(str(f))]
+    assert cut is True

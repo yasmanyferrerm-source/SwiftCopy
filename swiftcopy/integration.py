@@ -37,6 +37,16 @@ def app_icon() -> str:
     return f'"{target}",0'
 
 
+def pipe_name() -> str:
+    """Name of the local pipe the running SwiftCopy window listens on."""
+    import getpass
+    try:
+        user = getpass.getuser()
+    except Exception:  # noqa: BLE001
+        user = "user"
+    return f"SwiftCopy-{user}"
+
+
 # ------------------------------------------------------- Microsoft Store (MSIX)
 def package_family_name() -> str | None:
     """The Store package family name when running as an installed MSIX app, else None."""

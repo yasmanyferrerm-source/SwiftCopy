@@ -43,7 +43,7 @@ jobs:
           pyinstaller --noconfirm --clean --onedir --windowed
           --name SwiftCopy --icon assets/icon.ico
           --add-data "assets;assets"
-          --hidden-import win32com.client --hidden-import pythoncom --hidden-import pywintypes
+          --hidden-import win32com.client --hidden-import pythoncom --hidden-import pywintypes --hidden-import win32clipboard --hidden-import swiftcopy.hookhelper
           run_swiftcopy.py
 
       - name: Self-test the packaged app (Explorer folder lookup + Ctrl+V hook)
@@ -86,7 +86,7 @@ jobs:
           pyinstaller --noconfirm --onefile --windowed
           --name SwiftCopy-Portable --icon assets/icon.ico
           --add-data "assets;assets"
-          --hidden-import win32com.client --hidden-import pythoncom --hidden-import pywintypes
+          --hidden-import win32com.client --hidden-import pythoncom --hidden-import pywintypes --hidden-import win32clipboard --hidden-import swiftcopy.hookhelper
           run_swiftcopy.py
 
       - name: Build installer

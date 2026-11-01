@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import APP_NAME, __version__, integration, shell, theme
+from .helperproc import HelperProcess
 from .log import log, log_path, log_path_for_explorer
 from .dialogs import CollisionDialog, ErrorDialog
 from .engine import (
@@ -523,8 +524,6 @@ def group(title: str | None = None, sub: str | None = None) -> tuple[QFrame, QVB
 
 
 class MainWindow(QMainWindow):
-    paste_requested = Signal(int)
-    paste_resolved = Signal(object, str, str, object, bool)
     PAGES = ["New transfer", "Queue", "Problems", "Settings"]
 
     def __init__(self, icon: QIcon):
@@ -559,13 +558,15 @@ class MainWindow(QMainWindow):
             self.tray.setContextMenu(menu)
             self.tray.show()
 
-        # Ctrl+V in File Explorer goes through SwiftCopy
-        # the hook runs on its own thread; this signal brings each paste back to the window's thread
-        self.paste_requested.connect(self.explorer_paste, Qt.QueuedConnection)
-        self.paste_resolved.connect(self._paste_resolved, Qt.QueuedConnection)
-        self.paste_hook = integration.PasteHook(self.paste_requested.emit)
+        # Ctrl+V in File Explorer goes through SwiftCopy. The keyboard watcher lives in a
+        # small helper process (see hookhelper.py) so Windows never drops it for being slow;
+        # the helper sends each paste here over the app's local pipe.
+        self.paste_hook = HelperProcess(integration.pipe_name())
         if integration.IS_WIN and _truthy(self.store.value("intercept_paste", True)):
             self.paste_hook.install()
+        self.helper_timer = QTimer(self)
+        self.helper_timer.timeout.connect(self.paste_hook.check)  # restart it if it ever closes
+        self.helper_timer.start(5000)
         self.packaged = integration.is_packaged()
         if integration.IS_WIN and integration.frozen() and not self.packaged:
             try:  # keep startup / right-click entries pointing at this copy of the app
@@ -1148,7 +1149,9 @@ class MainWindow(QMainWindow):
             self.hook_last.setText("")
             return
         if self.paste_hook.active:
-            self.hook_status.setText("Ctrl+V takeover is running.")
+            extra = f" It has restarted itself {self.paste_hook.restarts} time(s)." if self.paste_hook.restarts else ""
+            self.hook_status.setText("Ctrl+V takeover is running. It checks itself every 15 seconds and "
+                                     "switches itself back on if Windows turns it off." + extra)
         elif self.int_paste.isChecked():
             self.hook_status.setText("Ctrl+V takeover should be on but isn't running. "
                                      "Press Restart, and send the log if it keeps happening.")
@@ -1183,40 +1186,17 @@ class MainWindow(QMainWindow):
         if cut:
             self.statusBar().showMessage("These files were cut in Explorer, so Move is probably what you want.", 6000)
 
-    def explorer_paste(self, root_hwnd: int):
-        """Ctrl+V caught in File Explorer: copy the clipboard files into that folder.
-        Asking Explorer for its folder can be slow, so that happens on a helper thread."""
-        paths, cut = clipboard_files()  # the clipboard must be read on the window's thread
-
-        def ask_explorer():
-            try:
-                folder, result, detail = integration.explorer_folder(root_hwnd)
-            except Exception as e:  # noqa: BLE001
-                folder, result, detail = None, integration.LOOKUP_FAILED, repr(e)
-            self.paste_resolved.emit(folder, result, detail, paths, cut)
-
-        threading.Thread(target=ask_explorer, name="SwiftCopy-ExplorerFolder", daemon=True).start()
-
-    def _paste_resolved(self, folder, result, detail, paths, cut):
+    def helper_paste(self, paths, dest, move):
+        """Ctrl+V caught in File Explorer by the helper process."""
         if not paths:
-            log(f"paste: clipboard had no files after all ({detail}) - handed to Windows")
-            integration.send_native_paste()
             return
-        if result == integration.NOT_A_FOLDER:
-            log(f"paste: {detail} - handed to Windows")
-            integration.send_native_paste()  # This PC, a phone, a zip... Windows handles those
-            return
-        if result == integration.LOOKUP_FAILED:
-            # Don't silently give the paste back to Windows - let the user pick the folder.
-            log(f"paste: couldn't read Explorer's folder ({detail}) - asking in SwiftCopy")
+        if not dest:
+            # The helper couldn't tell which folder Explorer shows - let the user pick it.
             self.set_sources(paths)
             self.statusBar().showMessage("SwiftCopy couldn't tell which folder Explorer is showing. "
                                          "Choose where to copy, then press Copy or Move.", 12000)
             return
-        log(f"paste: {len(paths)} item(s) {'moved' if cut else 'copied'} into {folder} ({detail})")
-        self.engine.add_job(paths, folder, move=cut)
-        if cut:
-            QApplication.clipboard().clear()  # same as Explorer: cut files paste once
+        self.engine.add_job(paths, dest, move=move)
         self.go(1)
         self.showNormal()
         self.raise_()

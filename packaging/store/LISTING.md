@@ -55,11 +55,12 @@ Make it yours with seven themes: Midnight, Daylight, Windows XP, Windows Vista, 
 
 SwiftCopy works entirely on your PC. No account, no ads, no tracking, and it never connects to the internet.
 
-### What's new in this version (1.4.0)
+### What's new in this version (1.5.0)
 
-- Much faster with big folders: copying thousands of files is up to 10× quicker
-- The window stays smooth during large copies (fixed a freeze on big jobs)
-- Ctrl+V in File Explorer responds instantly, even when Explorer is busy
+- Ctrl+V in File Explorer now stays with SwiftCopy: the keyboard watcher runs in its own
+  small helper, checks itself every 15 seconds and switches itself back on if Windows turns it off
+- If the helper ever closes, SwiftCopy restarts it automatically
+- Settings > Troubleshooting shows whether it's running and how often it repaired itself
 
 ### Short description
 

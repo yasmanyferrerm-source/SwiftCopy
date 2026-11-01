@@ -1,4 +1,4 @@
 """SwiftCopy - a file copy manager for Windows."""
 
 APP_NAME = "SwiftCopy"
-__version__ = "1.4.0"
+__version__ = "1.5.0"
