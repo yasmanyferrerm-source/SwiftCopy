@@ -30,10 +30,13 @@ class HelperProcess:
         self._next_try = 0.0
         self._fast_failures = 0
         self._started_at = 0.0
+        self.elsewhere = False  # another SwiftCopy's helper is already watching Ctrl+V
 
     @property
     def active(self) -> bool:
-        return self.proc is not None and self.proc.poll() is None
+        if self.proc is not None and self.proc.poll() is None:
+            return True
+        return self.elsewhere and self.enabled
 
     def _start(self) -> bool:
         self._stop()
@@ -72,6 +75,10 @@ class HelperProcess:
         deadline = time.monotonic() + 3
         while time.monotonic() < deadline:  # give it a moment: it exits at once if the hook fails
             if self.proc.poll() is not None:
+                if self.proc.returncode == 3:  # another helper is already on duty
+                    self.elsewhere = True
+                    self._next_try = time.monotonic() + 30
+                    return True
                 log(f"Ctrl+V helper stopped right away (code {self.proc.returncode})")
                 return False
             if time.monotonic() - self._started_at > 0.8:
@@ -85,9 +92,16 @@ class HelperProcess:
 
     def check(self) -> None:
         """Restart the helper if it closed unexpectedly (with a back-off if it keeps failing)."""
-        if not self.enabled or self.active or time.monotonic() < self._next_try:
+        running = self.proc is not None and self.proc.poll() is None
+        if not self.enabled or running or time.monotonic() < self._next_try:
             return
         code = self.proc.returncode if self.proc is not None else None
+        if code == 3:  # another SwiftCopy's helper is on duty - look again in 30 s
+            self.elsewhere = True
+            self._next_try = time.monotonic() + 30
+            self._start()  # takes over if that one has gone, otherwise exits with 3 again
+            return
+        self.elsewhere = False
         lived = time.monotonic() - self._started_at
         self._fast_failures = self._fast_failures + 1 if lived < 10 else 0
         delay = min(60, 2 ** self._fast_failures) if self._fast_failures else 0

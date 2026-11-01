@@ -29,8 +29,11 @@ VK_V, VK_F24 = 0x56, 0x87
 VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN = 0x11, 0x10, 0x12, 0x5B, 0x5C
 LLKHF_INJECTED = 0x10
 CF_HDROP = 15
-CANARY_TAG = 0x5357_4350  # "SWCP": marks our own F24 check presses
-CHECK_MS = 15_000
+CANARY_FAMILY = 0x5357_0000  # "SW" + this helper's process id: marks our own F24 check presses
+CHECK_MS = 5_000
+WM_PASSED = WM_APP + 1  # a Ctrl+V in Explorer we left to Windows (logged outside the hook)
+REASONS = {1: "no focused control", 2: "focus wasn't on the file list", 3: "clipboard had no files"}
+NAV_PANE_FOCUS = {"SysTreeView32"}  # Explorer's left-hand folder tree
 
 
 # --------------------------------------------------------------------- talking to SwiftCopy
@@ -125,6 +128,8 @@ class HookLoop:
         self.canary_seen = True
         self.holding_v = False
         self.rearms = 0
+        self.tag = CANARY_FAMILY | (os.getpid() & 0xFFFF)
+        self.passed_focus = ""
 
     def status(self, text: str) -> None:
         log("Ctrl+V " + text)
@@ -194,6 +199,7 @@ class HookLoop:
         kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
 
         tid = kernel32.GetCurrentThreadId()
+        keep_responsive(kernel32)
         parent = kernel32.OpenProcess(0x00100000, False, self.parent_pid) if self.parent_pid else None  # SYNCHRONIZE
 
         def down(vk):
@@ -205,24 +211,27 @@ class HookLoop:
             return buf.value
 
         def target():
-            """Root Explorer/desktop window if Ctrl+V should go to SwiftCopy, else None."""
+            """(root Explorer/desktop window, 0) if Ctrl+V should go to SwiftCopy,
+            else (None, reason) - reason 0 means 'not Explorer at all'."""
             fg = user32.GetForegroundWindow()
             if not fg:
-                return None
+                return None, 0
             root = user32.GetAncestor(fg, 2) or fg  # GA_ROOT
             root_cls = cls(root)
             if root_cls not in integration.EXPLORER_CLASSES and root_cls not in integration.DESKTOP_CLASSES:
-                return None
+                return None, 0
             info = GUITHREADINFO()
             info.cbSize = ctypes.sizeof(GUITHREADINFO)
             ftid = user32.GetWindowThreadProcessId(fg, None)
             if not user32.GetGUIThreadInfo(ftid, ctypes.byref(info)) or not info.hwndFocus:
-                return None
-            if cls(info.hwndFocus) not in integration.FILE_VIEW_FOCUS:
-                return None  # typing in the address bar, search box or a rename box
+                return None, 1
+            focus = cls(info.hwndFocus)
+            if focus not in integration.FILE_VIEW_FOCUS and focus not in NAV_PANE_FOCUS:
+                self.passed_focus = focus
+                return None, 2  # typing in the address bar, search box or a rename box
             if not user32.IsClipboardFormatAvailable(CF_HDROP):
-                return None
-            return int(root)
+                return None, 3
+            return int(root), 0
 
         # The hook callback must be quick and must never do I/O: it only looks at the
         # key and posts a message; everything else happens outside it.
@@ -230,7 +239,7 @@ class HookLoop:
             try:
                 if n_code == 0:
                     kb = ctypes.cast(l_param, ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
-                    if kb.vkCode == VK_F24 and kb.dwExtraInfo == CANARY_TAG:
+                    if kb.vkCode == VK_F24 and kb.dwExtraInfo == self.tag:
                         self.canary_seen = True
                         return 1  # our own check press - nobody else needs to see it
                     if kb.vkCode == VK_V and not kb.flags & LLKHF_INJECTED:
@@ -239,11 +248,13 @@ class HookLoop:
                                 return 1  # key repeat of a paste we already took
                             if (down(VK_CONTROL) and not down(VK_SHIFT) and not down(VK_MENU)
                                     and not down(VK_LWIN) and not down(VK_RWIN)):
-                                root = target()
+                                root, reason = target()
                                 if root:
                                     self.holding_v = True
                                     user32.PostThreadMessageW(tid, WM_APP, root, 0)
                                     return 1  # Explorer never sees this Ctrl+V
+                                if reason:
+                                    user32.PostThreadMessageW(tid, WM_PASSED, reason, 0)
                         elif w_param in (WM_KEYUP, WM_SYSKEYUP) and self.holding_v:
                             self.holding_v = False
             except Exception:  # noqa: BLE001 - a hook must never raise
@@ -265,7 +276,7 @@ class HookLoop:
             inputs = (INPUT * 2)()
             for i, flags in enumerate((0, 2)):  # key down, KEYEVENTF_KEYUP
                 inputs[i].type = 1  # INPUT_KEYBOARD
-                inputs[i].u.ki = KEYBDINPUT(VK_F24, 0, flags, 0, CANARY_TAG)
+                inputs[i].u.ki = KEYBDINPUT(VK_F24, 0, flags, 0, self.tag)
             self.canary_seen = False
             self.canary_sent = time.monotonic()
             return user32.SendInput(2, inputs, ctypes.sizeof(INPUT)) == 2
@@ -282,6 +293,12 @@ class HookLoop:
                 threading.Thread(target=handle_paste, args=(self.pipe, int(msg.wParam), self.status),
                                  name="SwiftCopy-Paste", daemon=True).start()
                 continue
+            if msg.message == WM_PASSED:
+                why = REASONS.get(int(msg.wParam), "unknown")
+                if int(msg.wParam) == 2 and self.passed_focus:
+                    why += f" ({self.passed_focus})"
+                self.status(f"left to Windows: {why}")
+                continue
             if msg.message == WM_TIMER:
                 if parent and kernel32.WaitForSingleObject(parent, 0) == 0:  # SwiftCopy has closed
                     break
@@ -289,8 +306,7 @@ class HookLoop:
                 # Windows removed the hook - put it back now.
                 if sent_ok and not self.canary_seen:
                     self.rearms += 1
-                    log(f"helper: Windows had switched off the keyboard watcher - turned it back on "
-                        f"(#{self.rearms})")
+                    log(f"helper: check press wasn't seen - keyboard watcher turned back on (#{self.rearms})")
                     hook = arm(hook) or hook
                 elif not sent_ok:
                     hook = arm(hook) or hook  # can't self-check (e.g. a locked screen) - re-arm anyway
@@ -303,6 +319,38 @@ class HookLoop:
         return 0
 
 
+def keep_responsive(kernel32) -> None:
+    """Stop Windows 11 putting this windowless background process into efficiency mode
+    (EcoQoS), which delays it enough for Windows to drop the keyboard hook, and run it at
+    high priority so it always answers a key press in time."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESS_POWER_THROTTLING_STATE(ctypes.Structure):
+        _fields_ = [("Version", wintypes.ULONG), ("ControlMask", wintypes.ULONG),
+                    ("StateMask", wintypes.ULONG)]
+
+    try:
+        proc = kernel32.GetCurrentProcess()
+        state = PROCESS_POWER_THROTTLING_STATE(1, 0x1 | 0x4, 0)  # EXECUTION_SPEED | IGNORE_TIMER_RESOLUTION: off
+        kernel32.SetProcessInformation(proc, 4, ctypes.byref(state), ctypes.sizeof(state))  # ProcessPowerThrottling
+        kernel32.SetPriorityClass(proc, 0x80)  # HIGH_PRIORITY_CLASS
+        kernel32.SetThreadPriority(kernel32.GetCurrentThread(), 15)  # THREAD_PRIORITY_TIME_CRITICAL
+    except Exception as e:  # noqa: BLE001
+        log(f"helper: couldn't raise priority: {e!r}")
+
+
+def single_helper():
+    """Only one helper may watch Ctrl+V. Returns a mutex handle to keep, or None if one is already running."""
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    handle = kernel32.CreateMutexW(None, False, "Local\\SwiftCopy-CtrlV-helper")
+    if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+        return None
+    return handle
+
+
 def main(argv=None) -> int:
     import argparse
     p = argparse.ArgumentParser()
@@ -312,6 +360,10 @@ def main(argv=None) -> int:
     args = p.parse_args(sys.argv[1:] if argv is None else argv)
     if not integration.IS_WIN:
         return 1
+    mutex = single_helper()
+    if mutex is None:
+        log("helper: another SwiftCopy helper is already watching Ctrl+V - this one isn't needed")
+        return 3
     try:
         import pythoncom
         pythoncom.CoInitialize()

@@ -171,3 +171,20 @@ def test_clipboard_files_round_trip(tmp_path):
     paths, cut = hookhelper.read_clipboard_files()
     assert [os.path.normcase(p) for p in paths] == [os.path.normcase(str(f))]
     assert cut is True
+
+
+def test_only_one_helper_at_a_time():
+    import time
+    from swiftcopy.helperproc import HelperProcess
+    a = HelperProcess("SwiftCopy-test-one")
+    b = HelperProcess("SwiftCopy-test-two")
+    assert a.install()
+    time.sleep(1)
+    assert b.install()           # second one notices the first and stands by
+    assert b.elsewhere and b.proc.poll() == 3
+    a.uninstall()
+    b._next_try = 0
+    b.check()                    # first one gone: second takes over
+    time.sleep(1.5)
+    assert b.proc.poll() is None
+    b.uninstall()

@@ -1150,8 +1150,9 @@ class MainWindow(QMainWindow):
             return
         if self.paste_hook.active:
             extra = f" It has restarted itself {self.paste_hook.restarts} time(s)." if self.paste_hook.restarts else ""
-            self.hook_status.setText("Ctrl+V takeover is running. It checks itself every 15 seconds and "
-                                     "switches itself back on if Windows turns it off." + extra)
+            where = " (handled by another open SwiftCopy)" if self.paste_hook.elsewhere else ""
+            self.hook_status.setText("Ctrl+V takeover is running" + where + ". It checks itself every 5 "
+                                     "seconds and switches itself back on if Windows turns it off." + extra)
         elif self.int_paste.isChecked():
             self.hook_status.setText("Ctrl+V takeover should be on but isn't running. "
                                      "Press Restart, and send the log if it keeps happening.")

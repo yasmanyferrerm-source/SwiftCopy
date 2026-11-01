@@ -54,6 +54,21 @@ def send_to_running(payload: dict) -> bool:
     return True
 
 
+_instance_mutex = None
+
+
+def first_instance() -> bool:
+    """True if no other SwiftCopy window is running or starting (named mutex)."""
+    global _instance_mutex
+    if os.name != "nt":
+        return True
+    import ctypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    _instance_mutex = kernel32.CreateMutexW(None, False, "Local\\SwiftCopy-app")
+    return ctypes.get_last_error() != 183  # ERROR_ALREADY_EXISTS
+
+
 def selftest(path: str) -> int:
     """Checks the packaged app can do the Explorer parts (used by the build)."""
     from . import integration
@@ -121,6 +136,13 @@ def main(argv=None) -> int:
     # Already running? Add these files to its queue instead of opening a second window.
     if send_to_running(payload):
         return 0
+    if not first_instance():
+        # Another SwiftCopy is starting at the same moment (e.g. the Store copy and the
+        # installer copy both launched at sign-in): wait for it and hand over to it.
+        for _ in range(40):
+            time.sleep(0.25)
+            if send_to_running(payload):
+                return 0
 
     QLocalServer.removeServer(server_name())
     server = QLocalServer()
